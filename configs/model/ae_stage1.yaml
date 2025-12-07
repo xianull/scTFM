@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  # 依赖注入：将 net/ae/vanilla.yaml 的内容挂载到 'net' 节点
+  - net/ae@model.net: vanilla
+  - _self_
+
+model:
+  _target_: src.models.ae_module.AELitModule
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 0.0001
+    weight_decay: 1e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: min
+    factor: 0.5
+    patience: 3

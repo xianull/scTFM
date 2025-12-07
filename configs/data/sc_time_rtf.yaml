@@ -1,0 +1,9 @@
+_target_: src.data.sc_datamodule.SingleCellDataModule
+# 建议：如果是 Latent Flow，这里应指向预处理好的 Latent Embeddings 的 TileDB 路径
+# 如果没有预处理，则使用 Raw Data，并在 Model 内部集成 AE Encoder (Freeze)
+data_dir: /gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/tiledb_100m/all_data
+batch_size: 4096
+num_workers: 8
+train_val_split: 0.95
+pin_memory: True
+tile_cache_size: 4000000000

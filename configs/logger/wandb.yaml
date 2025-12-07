@@ -1,0 +1,8 @@
+wandb:
+  _target_: pytorch_lightning.loggers.wandb.WandbLogger
+  project: "scTime-AE"
+  name: "vanilla_ae_baseline"
+  save_dir: "${paths.output_dir}"
+  offline: True
+  id: null
+  log_model: False

@@ -1,0 +1,33 @@
+# configs/hydra/default.yaml
+
+# 【修改前 - 错误】依赖了还未加载的 paths 配置
+# run:
+#   dir: ${paths.log_dir}/${task_name}/runs/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+# 【修改后 - 正确】直接使用环境变量 (oc.env:PROJECT_ROOT)
+# 这样 Hydra 在启动早期就能解析出绝对路径，不需要等待 paths 配置加载
+run:
+  dir: ${oc.env:PROJECT_ROOT}/logs/${task_name}/runs/${now:%Y-%m-%d}_${now:%H-%M-%S}
+
+sweep:
+  dir: ${oc.env:PROJECT_ROOT}/logs/${task_name}/multiruns/${now:%Y-%m-%d}_${now:%H-%M-%S}
+  subdir: ${hydra.job.num}
+
+job_logging:
+  handlers:
+    console:
+      class: logging.StreamHandler
+      formatter: colorlog
+      stream: ext://sys.stdout
+
+  formatters:
+    colorlog:
+      class: colorlog.ColoredFormatter
+      format: '[%(cyan)s%(asctime)s%(reset)s][%(blue)s%(name)s%(reset)s][%(log_color)s%(levelname)s%(reset)s] - %(message)s'
+      datefmt: '%Y-%m-%d %H:%M:%S'
+      log_colors:
+        DEBUG: purple
+        INFO: green
+        WARNING: yellow
+        ERROR: red
+        CRITICAL: red,bg_white

@@ -1,0 +1,10 @@
+# configs/extras/default.yaml
+
+# 是否忽略 python warnings
+ignore_warnings: True
+
+# 是否强制要求必须使用 tags (防止实验乱七八糟)
+enforce_tags: False
+
+# 是否在开始时打印整个 config 树
+print_config: True

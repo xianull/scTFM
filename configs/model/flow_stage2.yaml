@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - _self_
+
+model:
+  _target_: src.models.flow_module.RectifiedFlowLitModule
+
+  net:
+    _target_: src.models.components.backbone.mlp.ConditionalMLP
+    # 【注意】
+    # 如果是在 Stage 1 AE 的 Latent Space 上训练，in_dim 应等于 AE 的 latent_dim (如 64)
+    # 如果是直接在 Raw Gene Space 上训练，in_dim 应等于基因数量 (如 20000+)
+    in_dim: 64 
+    cond_dim: 0
+    hidden_dims: [1024, 1024, 1024, 1024]
+    dropout: 0.1
+    time_emb_dim: 64
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: min
+    factor: 0.5
+    patience: 5
