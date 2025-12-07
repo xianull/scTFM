@@ -77,10 +77,11 @@ class SingleCellDataModule(LightningDataModule):
             with tiledb.open(meta_uri, mode='r', ctx=ctx) as A:
                 # 只读取需要的列，减少 IO
                 if total_cells is not None:
-                    # 精确读取有效范围
-                    is_ood = A.query(attrs=["is_ood"])[0:total_cells-1]["is_ood"]
+                    # 精确读取有效范围 (Python 切片是左闭右开，所以使用 total_cells)
+                    # 例如: total_cells=100, 索引 0..99, 切片 0:100 返回 100 个元素
+                    is_ood = A.query(attrs=["is_ood"])[0:total_cells]["is_ood"]
                 else:
-                    # Fallback: 如果没有 json (比如旧数据)，尝试读取非空域或直接全读 (可能有风险)
+                    # 备选方案: 如果没有 json (比如旧数据)，尝试读取非空域或直接全读 (可能有风险)
                     print("Warning: total_cells unknown, using full slice (risky for Dense Arrays)...")
                     # 对于 Dense Array，如果没有 non_empty_domain，这步可能会挂
                     # 但我们假设旧数据是 Sparse 的，所以 [:] 是安全的
