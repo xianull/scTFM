@@ -210,6 +210,14 @@ class AsyncBatchWriter:
         self.current_buffer = self._init_buffer()
         self.current_count = 0
 
+    def wait_until_idle(self):
+        """等待所有写入任务完成 (用于中间同步)"""
+        # 1. 强制提交当前缓存中的剩余数据
+        self._push_to_queue()
+        # 2. 阻塞直到队列清空
+        self.write_queue.join()
+        if self.write_error: raise self.write_error
+
     def _writer_loop(self):
         while self.is_running or not self.write_queue.empty():
             try:
@@ -293,6 +301,33 @@ def consolidate_arrays(tiledb_path: Path):
     
     logger.info("Consolidation complete.")
 
+def sync_to_disk(shm_path: Path, final_path: Path):
+    """
+    中间同步：合并碎片 -> Rsync -> (保留 SHM 继续写入)
+    """
+    logger.info("🔄 Triggering intermediate sync...")
+    t_start = time.time()
+    
+    # 1. Consolidate (in RAM)
+    # 合并碎片，避免 rsync 传输大量小文件
+    # 注意：tiledb 数据在 shm_path/all_data 下
+    tiledb_path = shm_path / "all_data"
+    consolidate_arrays(tiledb_path)
+    
+    # 2. Rsync (RAM -> GPFS)
+    # 使用 --delete 确保 GPFS 上删除了被 consolidate 掉的旧碎片
+    if not final_path.parent.exists():
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        
+    # 注意：源目录加斜杠 (shm_path/) 表示同步内容
+    # 去掉了 -P 以减少日志刷屏，保留 -av
+    cmd = ["rsync", "-av", "--delete", str(shm_path) + "/", str(final_path) + "/"]
+    try:
+        subprocess.run(cmd, check=True)
+        logger.info(f"✅ Sync complete in {time.time() - t_start:.1f}s")
+    except Exception as e:
+        logger.error(f"❌ Sync failed: {e}")
+
 def main():
     parser = argparse.ArgumentParser(description="Efficient TileDB Converter (In-Memory Fast Track)")
     parser.add_argument("--csv_path", type=str, default="data/assets/ae_data_info_1000.csv")
@@ -309,6 +344,7 @@ def main():
     # 4096 * 128 = 524288
     parser.add_argument("--batch_size", type=int, default=524288)
     parser.add_argument("--max_files", type=int, default=1000)
+    parser.add_argument("--sync_interval", type=int, default=-1, help="每处理多少个文件同步一次到硬盘 (-1 表示不开启)")
     
     args = parser.parse_args()
     
@@ -362,12 +398,25 @@ def main():
     writer = AsyncBatchWriter(tiledb_path, batch_size=args.batch_size)
     logger.info(f"Starting processing {len(tasks)} files...")
     
+    processed_count = 0
+    sync_interval = args.sync_interval
+
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
         futures = {executor.submit(process_h5ad_vectorized, task): task[0] for task in tasks}
         for future in tqdm(as_completed(futures), total=len(tasks), desc="Processing & Writing (RAM)"):
             try:
                 result = future.result()
-                if result: writer.add(result)
+                if result: 
+                    writer.add(result)
+                    
+                    # --- [新增] 定期同步逻辑 ---
+                    processed_count += 1
+                    if sync_interval > 0 and processed_count % sync_interval == 0:
+                        logger.info(f"⏳ Reached {processed_count} files. Pausing to sync...")
+                        writer.wait_until_idle() # 1. 确保写入队列清空
+                        sync_to_disk(shm_path, final_path) # 2. 整理碎片并同步
+                        logger.info("▶️ Resuming processing...")
+                        
             except Exception as e:
                 logger.error(f"Failed: {e}")
 
@@ -393,12 +442,14 @@ def main():
     
     # 确保目标父目录存在
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    if final_path.exists():
-        shutil.rmtree(final_path) # 如果目标已存在，先删除（慎用，或者改名）
+    # 移除暴力删除，改用 rsync --delete 增量更新，避免在此前做过 sync 的情况下浪费时间
+    # if final_path.exists():
+    #     shutil.rmtree(final_path) 
     
     # 使用 rsync 进行搬运 (比 shutil 更稳健，显示进度)
     try:
-        cmd = ["rsync", "-avP", str(shm_path) + "/", str(final_path) + "/"]
+        # 添加 --delete 以确保最终状态完全一致
+        cmd = ["rsync", "-avP", "--delete", str(shm_path) + "/", str(final_path) + "/"]
         subprocess.run(cmd, check=True)
         logger.info(f"✅ SUCCESS! Data moved to: {final_path}")
         

@@ -1,6 +1,8 @@
 import tiledb
 import torch
 import numpy as np
+import json
+import os
 from pytorch_lightning import LightningDataModule
 from torch.utils.data import DataLoader
 from src.data.components.tiledb_dataset import TileDBDataset, TileDBCollator
@@ -57,10 +59,33 @@ class SingleCellDataModule(LightningDataModule):
 
         # 2. 读取 Metadata 进行过滤 (必须传入 ctx)
         print(f"Loading metadata from {meta_uri}...")
+        
+        # [Fix] 尝试从 metadata.json 获取真实的 total_cells
+        # 对于 Dense Array，必须指定读取范围，不能使用 [:]，否则会读取整个 Domain (int64.max) 导致 OOM
+        total_cells = None
+        meta_json_path = os.path.join(self.hparams.data_dir, "metadata.json")
+        if os.path.exists(meta_json_path):
+            try:
+                with open(meta_json_path, 'r') as f:
+                    meta_info = json.load(f)
+                    total_cells = meta_info.get('total_cells')
+                    print(f"Found metadata.json: total_cells = {total_cells}")
+            except Exception as e:
+                print(f"Warning: Failed to read metadata.json: {e}")
+
         try:
             with tiledb.open(meta_uri, mode='r', ctx=ctx) as A:
                 # 只读取需要的列，减少 IO
-                is_ood = A.query(attrs=["is_ood"])[:]["is_ood"]
+                if total_cells is not None:
+                    # 精确读取有效范围
+                    is_ood = A.query(attrs=["is_ood"])[0:total_cells-1]["is_ood"]
+                else:
+                    # Fallback: 如果没有 json (比如旧数据)，尝试读取非空域或直接全读 (可能有风险)
+                    print("Warning: total_cells unknown, using full slice (risky for Dense Arrays)...")
+                    # 对于 Dense Array，如果没有 non_empty_domain，这步可能会挂
+                    # 但我们假设旧数据是 Sparse 的，所以 [:] 是安全的
+                    is_ood = A.query(attrs=["is_ood"])[:]["is_ood"]
+                    
         except Exception as e:
              raise FileNotFoundError(f"Could not read metadata at {meta_uri}") from e
         
