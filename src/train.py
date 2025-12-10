@@ -10,6 +10,7 @@ root = pyrootutils.setup_root(
 )
 
 import hydra
+import wandb
 from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
 from pytorch_lightning import Callback, LightningDataModule, LightningModule, Trainer
@@ -129,7 +130,8 @@ def main(cfg: DictConfig):
             ckpt_path = None
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
-    pass
+    # Make sure to close the wandb run to avoid leaking into the next job in multirun
+    wandb.finish()
 if __name__ == "__main__":
     # 我们在读取数据的时候关锁了
     # TileDB 底层是复杂的 C++ 库。当 Python 进程被 fork 时，父进程中的 C++ 状态（如线程池、文件句柄）会被复制到子进程中，但这种复制往往是不安全的（Not Fork-Safe）。

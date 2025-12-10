@@ -2,7 +2,7 @@ _target_: src.data.sc_datamodule.SingleCellDataModule
 # Flash 存储路径 (从 hybrid 同步过来，I/O 性能提升 10-50x)
 data_dir: /dev/shm/tiledb_all_data/all_data
 batch_size: 8192
-num_workers: 4    # [关键] 8卡DDP下总并发=8。解决 GPFS I/O 拥塞 (D状态进程) 的最佳实践。
+num_workers: 2    # [关键] 8卡DDP下总并发=8。解决 GPFS I/O 拥塞 (D状态进程) 的最佳实践。
 train_val_split: 0.95
 pin_memory: True
 # 核心优化：大幅减小单进程缓存，因为 Worker 数量多

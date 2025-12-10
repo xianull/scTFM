@@ -1,0 +1,41 @@
+# @package _global_
+
+defaults:
+  - override /data: sc_atlas_ae
+  - override /model: ae_stage1
+  - override /trainer: default
+
+task_name: "ae_stage1_sweep_1210"
+
+tags: ["ae", "stage1", "sweep", "1210"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 10
+  gradient_clip_val: 0.5
+
+model:
+  optimizer:
+    lr: 1e-4
+  net:
+    # 默认值
+    hidden_dims: [4096, 2048, 1024, 512]
+    latent_dim: 64
+
+logger:
+  wandb:
+    group: "ae_stage1_sweep"
+    name: "ae_stage1_${hydra:job.num}"
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # 修正：使用字符串格式，并用引号包裹整个列表，防止内部逗号被误分割
+      # 注意：不要在列表内部使用空格，确保 Hydra 解析正确
+      model.net.hidden_dims: "[8192,4096,2048,1024,512],[4096, 2048, 2048, 1024, 512]"
+      
+      # 修正：使用逗号分隔的字符串
+      model.net.latent_dim: 256,512
