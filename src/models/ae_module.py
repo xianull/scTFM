@@ -30,7 +30,7 @@ class AELitModule(LightningModule):
 
         self.save_hyperparameters(logger=False, ignore=["net"])
         self.net = net
-        
+
         if compile and hasattr(torch, "compile"):
             self.net = torch.compile(self.net)
 

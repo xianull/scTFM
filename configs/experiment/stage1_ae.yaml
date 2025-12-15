@@ -7,13 +7,13 @@ defaults:
 
 task_name: "ae_stage1_sweep_1210"
 
-tags: ["ae", "stage1", "sweep", "1210"]
+tags: ["ae", "sweep", "tiledbsoma", "1215"]
 
 seed: 12345
 
 trainer:
   min_epochs: 1
-  max_epochs: 10
+  max_epochs: 2
   gradient_clip_val: 0.5
 
 model:
@@ -38,4 +38,4 @@ hydra:
       model.net.hidden_dims: "[8192,4096,2048,1024,512],[4096, 2048, 2048, 1024, 512]"
       
       # 修正：使用逗号分隔的字符串
-      model.net.latent_dim: 256,512
+      model.net.latent_dim: 512,1024

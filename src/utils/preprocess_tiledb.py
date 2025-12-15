@@ -20,10 +20,10 @@ from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
-CSV_PATH = '/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/assets/ae_data_info.csv'
-GENE_ORDER_PATH = "/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/assets/gene_order.tsv"
-OUTPUT_BASE_URI = "/fast/data/scTFM/ae/tile_4000_fix"
-NUM_SAMPLES = 4000
+CSV_PATH = '/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/ae_data_info.csv'
+GENE_ORDER_PATH = "/gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/gene_order.tsv"
+OUTPUT_BASE_URI = "/fast/data/scTFM/ae/tiledb_all"
+NUM_SAMPLES = 16000
 MAX_WORKERS = 16  
 
 
