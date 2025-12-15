@@ -1,0 +1,23 @@
+_target_: src.data.flow_datamodule.FlowDataModule
+
+# 数据路径
+# 模式 1 (Latent): 指向 extract_latents.py 的输出目录
+# 模式 2 (Raw): 指向原始 TileDB 数据目录
+data_dir: /fast/data/scTFM/flow/latents_v1/
+
+batch_size: 1024
+num_workers: 4
+pin_memory: True
+persistent_workers: True
+
+# 数据源 Key
+# 模式 1 (Latent): X_latent
+# 模式 2 (Raw): ms/RNA/X/data
+latent_key: X_latent
+
+# 条件元数据 Key (在 obs 中的列名)
+# 如果原始数据列名不同，可以在这里修改
+condition_keys:
+  time: "unified_time"
+  tissue: "tissue_code"
+  celltype: "celltype_code"

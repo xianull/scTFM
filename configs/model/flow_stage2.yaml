@@ -1,31 +1,48 @@
 # @package _global_
 
 defaults:
+  - net/backbone@model.net: dit
   - _self_
 
 model:
-  _target_: src.models.flow_module.RectifiedFlowLitModule
+  _target_: src.models.flow_module.FlowLitModule
 
-  net:
-    _target_: src.models.components.backbone.mlp.ConditionalMLP
-    # 【注意】
-    # 如果是在 Stage 1 AE 的 Latent Space 上训练，in_dim 应等于 AE 的 latent_dim (如 64)
-    # 如果是直接在 Raw Gene Space 上训练，in_dim 应等于基因数量 (如 20000+)
-    in_dim: 64 
-    cond_dim: 0
-    hidden_dims: [1024, 1024, 1024, 1024]
-    dropout: 0.1
-    time_emb_dim: 64
-
+  # 优化器
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
     lr: 1e-4
     weight_decay: 1e-5
 
+  # 学习率调度
   scheduler:
     _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
     _partial_: true
     mode: min
     factor: 0.5
-    patience: 5
+    patience: 3
+
+# ===================================================================
+# 模式选择指南
+# ===================================================================
+
+# 模式 1: Latent Space Training (推荐)
+# 1. 运行 scripts/extract_latents.py 生成 Latent 数据
+# 2. 设置 data.data_dir 为 latent 输出路径
+# 3. 设置 data.latent_key = "X_latent"
+# 4. 设置 model.net.input_dim = Latent Dim (例如 64)
+
+# 模式 2: Raw Gene Space Training
+# 1. 设置 data.data_dir 为原始 TileDB 路径
+# 2. 设置 data.latent_key = "ms/RNA/X/data"
+# 3. 设置 model.net.input_dim = Gene Count (例如 19138)
+# 注意：此模式下显存消耗较大，需调小 Batch Size
+
+# ===================================================================
+# 默认配置 (Latent Mode)
+# ===================================================================
+# 如果需要在命令行覆盖为 Raw Mode，请使用：
+# python src/train.py model=flow_stage2 \
+#   model.net.input_dim=19138 \
+#   data.latent_key="ms/RNA/X/data" \
+#   data.batch_size=128

@@ -24,18 +24,8 @@ class AELitModule(LightningModule):
         compile: bool = False,
         kld_weight: float = 0.00001, # VAE KL 权重
         reg_type: str = "none",      # 'none' | 'l2' (RAE) | 'l1' (SAE)
-        reg_weight: float = 1e-4,    # 正则化权重
+        reg_weight: float = 1e-4,    # 正则化强度
     ):
-        """
-        Args:
-            net: 网络实例
-            optimizer: 优化器
-            scheduler: 调度器
-            compile: 是否编译
-            kld_weight: VAE KL 散度权重
-            reg_type: 正则化类型 ('l2' 为 RAE, 'l1' 为 SAE)
-            reg_weight: 正则化强度
-        """
         super().__init__()
 
         self.save_hyperparameters(logger=False, ignore=["net"])
@@ -48,6 +38,7 @@ class AELitModule(LightningModule):
         return self.net(x)
 
     def on_train_start(self):
+        # 初始化验证损失，防止第一次sanity check前报错
         self.log("val/loss", 0.0, sync_dist=True)
 
     def model_step(self, batch: Any):
@@ -58,47 +49,32 @@ class AELitModule(LightningModule):
         outputs = self.forward(x)
         
         # 3. 计算 Loss
-        # -----------------------------------------------
-        # Case A: VAE (返回 4 个值: recon, z, mu, logvar)
-        # -----------------------------------------------
-        if len(outputs) == 4:
+        if len(outputs) == 4: # VAE
             recon_x, z, mu, logvar = outputs
-            
-            # Reconstruction
             loss_recon = F.mse_loss(recon_x, x)
-            
-            # KL Divergence
             loss_kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-            loss_kl = loss_kl / x.shape[0] # Batch mean
-            
+            loss_kl = loss_kl / x.shape[0]
             loss = loss_recon + self.hparams.kld_weight * loss_kl
             
-            self.log("train/recon_loss", loss_recon, on_step=False, on_epoch=True)
-            self.log("train/kl_loss", loss_kl, on_step=False, on_epoch=True)
+            # 使用 sync_dist=True 解决 DDP 警告
+            self.log("train/recon_loss", loss_recon, on_step=False, on_epoch=True, sync_dist=True)
+            self.log("train/kl_loss", loss_kl, on_step=False, on_epoch=True, sync_dist=True)
 
-        # -----------------------------------------------
-        # Case B: Deterministic AE (返回 2 个值: recon, z)
-        # -----------------------------------------------
-        elif len(outputs) == 2:
+        elif len(outputs) == 2: # AE / RAE / SAE
             recon_x, z = outputs
             loss_recon = F.mse_loss(recon_x, x)
             loss = loss_recon
             
-            # RAE (L2 Regularization)
             if self.hparams.reg_type == 'l2':
-                # L2 norm of latent code
                 loss_reg = torch.mean(torch.sum(z ** 2, dim=1)) * self.hparams.reg_weight
                 loss += loss_reg
-                self.log("train/reg_loss_l2", loss_reg, on_step=False, on_epoch=True)
-                
-            # SAE (L1 Regularization - Sparsity)
+                self.log("train/reg_loss_l2", loss_reg, on_step=False, on_epoch=True, sync_dist=True)
             elif self.hparams.reg_type == 'l1':
-                # L1 norm of latent code
                 loss_reg = torch.mean(torch.sum(torch.abs(z), dim=1)) * self.hparams.reg_weight
                 loss += loss_reg
-                self.log("train/reg_loss_l1", loss_reg, on_step=False, on_epoch=True)
+                self.log("train/reg_loss_l1", loss_reg, on_step=False, on_epoch=True, sync_dist=True)
                 
-            self.log("train/recon_loss", loss_recon, on_step=False, on_epoch=True)
+            self.log("train/recon_loss", loss_recon, on_step=False, on_epoch=True, sync_dist=True)
             
         else:
             raise ValueError(f"Unexpected output format: len={len(outputs)}")
@@ -107,17 +83,20 @@ class AELitModule(LightningModule):
 
     def training_step(self, batch: Any, batch_idx: int):
         loss, _, _ = self.model_step(batch)
-        self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        # 关键修复: 添加 sync_dist=True
+        self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: Any, batch_idx: int):
         loss, _, _ = self.model_step(batch)
-        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        # 验证集通常不需要 sync_dist，除非你需要精确的全局平均 loss
+        # 但加上是个好习惯，特别是为了 monitor
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def test_step(self, batch: Any, batch_idx: int):
         loss, _, _ = self.model_step(batch)
-        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("test/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def configure_optimizers(self):
