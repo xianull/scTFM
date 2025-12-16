@@ -2,6 +2,9 @@ import pyrootutils
 import torch.multiprocessing as mp
 import torch
 import os
+import json
+import tempfile
+from pathlib import Path
 
 root = pyrootutils.setup_root(
     search_from=__file__,
@@ -60,48 +63,104 @@ def log_hyperparameters_to_wandb(
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def main(cfg: DictConfig):
     # ---------------------------------------------------------------------------
-    # [DDP 关键修复] 
-    # 1. 只有主进程 (Rank 0) 负责计算统计信息，避免所有进程同时读 IO 导致死锁或拥塞
-    # 2. 统计信息计算移到 seed 之前，防止 DDP 初始化后的干扰
+    # [关键] 使用文件缓存避免 DDP 多进程重复计算
+    # 主进程（spawn 前）计算并保存，子进程（spawn 后）直接读取
     # ---------------------------------------------------------------------------
     
-    # 检测是否是主进程 (在 Hydra/Lightning 初始化前比较 tricky，只能靠环境变量)
-    # PyTorch Lightning DDP 启动时会设置 LOCAL_RANK
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    limit_train_batches = None
-    
-    if cfg.get("train") and local_rank == 0:
+    if cfg.get("train"):
+        import json
+        import tempfile
+        from pathlib import Path
+        
+        # 获取当前进程的 Rank
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        rank = int(os.environ.get("RANK", -1))
+        
+        # 判断是否是主进程（spawn 前：两个都是 -1；spawn 后：会有具体值）
+        is_pre_ddp = (local_rank == -1 and rank == -1)
+        
         try:
             data_dir = cfg.data.get("data_dir")
             batch_size = cfg.data.get("batch_size", 256)
             
             # 计算 World Size
-            if cfg.trainer.get("devices") == "auto":
+            devices = cfg.trainer.get("devices")
+            if devices == "auto":
                 world_size = torch.cuda.device_count()
-            elif isinstance(cfg.trainer.get("devices"), list):
-                world_size = len(cfg.trainer.get("devices"))
-            elif isinstance(cfg.trainer.get("devices"), int):
-                world_size = cfg.trainer.get("devices")
+            elif isinstance(devices, (list, tuple)) or OmegaConf.is_list(devices):
+                world_size = len(devices)
+            elif isinstance(devices, int):
+                world_size = devices
+            elif isinstance(devices, str) and devices.isdigit():
+                world_size = int(devices)
             else:
-                world_size = 1
+                if isinstance(devices, str) and "," in devices:
+                    world_size = len(devices.split(","))
+                else:
+                    world_size = 1
+            
+            # 使用数据目录的 hash 作为缓存文件名，避免不同数据集冲突
+            cache_key = f"{data_dir}_{batch_size}_{world_size}".replace("/", "_")
+            cache_file = Path(tempfile.gettempdir()) / f"scTFM_stats_{cache_key}.json"
+            
+            # 获取 DataLoader workers 数（用于负载均衡）
+            num_workers_per_gpu = cfg.data.get("num_workers", 16)
+            
+            if is_pre_ddp:
+                # 主进程：计算并缓存
+                log.info(f"📊 [Main Process] Calculating dataset stats (World Size={world_size})...")
                 
-            log.info(f"Rank {local_rank}: Calculating total dataset size (World Size={world_size})...")
+                from src.utils.dataset_stats_utils import balanced_shard_assignment
+                
+                total_cells, total_steps, shard_sizes = get_dataset_stats(
+                    root_dir=data_dir,
+                    split_label=0, 
+                    batch_size=batch_size,
+                    num_workers=16,  # 只有一个进程计算，可以开大
+                    world_size=world_size,
+                    num_workers_per_gpu=num_workers_per_gpu
+                )
+                
+                # 计算负载均衡的分配方案
+                total_workers = world_size * num_workers_per_gpu
+                assignment = balanced_shard_assignment(shard_sizes, total_workers)
+                
+                # 保存到缓存文件
+                cache_file.write_text(json.dumps({
+                    "total_cells": total_cells,
+                    "total_steps": total_steps,
+                    "world_size": world_size,
+                    "batch_size": batch_size,
+                    "num_workers_per_gpu": num_workers_per_gpu,
+                    "shard_sizes": shard_sizes,
+                    "assignment": {str(k): v for k, v in assignment.items()}  # JSON keys must be strings
+                }))
+                
+                log.info(f"✅ [Main] Cached stats + assignment: {total_steps} steps → {cache_file}")
+                
+            else:
+                # DDP 子进程：读取缓存
+                if cache_file.exists():
+                    stats = json.loads(cache_file.read_text())
+                    total_steps = stats["total_steps"]
+                    log.info(f"📥 [Rank {local_rank}] Loaded from cache: {total_steps} steps")
+                else:
+                    log.warning(f"⚠️ [Rank {local_rank}] Cache not found, recalculating...")
+                    from src.utils.dataset_stats_utils import balanced_shard_assignment
+                    total_cells, total_steps, shard_sizes = get_dataset_stats(
+                        root_dir=data_dir, split_label=0, 
+                        batch_size=batch_size, num_workers=4, world_size=world_size,
+                        num_workers_per_gpu=num_workers_per_gpu
+                    )
             
-            # 使用多进程加速
-            total_cells, total_steps = get_dataset_stats(
-                root_dir=data_dir,
-                split_label=0, 
-                batch_size=batch_size,
-                num_workers=32, # 可以开大一点，因为是 IO 密集型
-                world_size=world_size
-            )
-            
+            # 设置配置
             if total_steps > 0:
-                limit_train_batches = total_steps
-                log.info(f"Rank {local_rank}: Calculated limit_train_batches = {limit_train_batches}")
+                OmegaConf.set_struct(cfg, False)
+                cfg.trainer.limit_train_batches = total_steps
+                OmegaConf.set_struct(cfg, True)
                 
         except Exception as e:
-            log.warning(f"Failed to calculate stats: {e}")
+            log.warning(f"❌ Failed to handle dataset stats: {e}")
 
     # ---------------------------------------------------------------------------
     # [Hydra/Lightning 初始化]
@@ -113,55 +172,44 @@ def main(cfg: DictConfig):
 
     # 2. DataModule
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
-
-    # 3. 注入 limit_train_batches
-    # 注意：在 DDP 中，必须确保所有进程的配置一致，否则会报错。
-    # 但 limit_train_batches 如果只在 Rank 0 设置，其他 Rank 默认为 infinite，可能会不同步。
-    # 不过 Lightning 内部通常会广播这个值，或者我们需要确保手动广播。
-    # 更安全的做法是：在 rank 0 计算后，不通过 Hydra 注入，而是通过 Trainer 参数？
-    # 不，Hydra 配置是各自加载的。
-    # 既然我们无法简单地在进程间通信（还没初始化 DDP），我们只能让每个进程都算，或者接受 Rank 0 算完（稍微慢点），其他进程也算（并发 IO）。
     
-    # 修正策略：
-    # 上面的 local_rank == 0 策略在 DDP spawn 模式下可能不生效（因为还没 spawn）。
-    # 如果是用 torchrun 启动，环境变量已有。如果是 Lightning 内部 spawn，则还没。
-    # 考虑到我们用的是 srun 或 python train.py (单机多卡)，通常是 spawn。
-    
-    # 最稳妥的方式：
-    # 直接在所有进程都算。但为了解决"慢"和"卡死"，我们采用了优化后的 ProcessPool。
-    # ProcessPool 在 DDP 启动前运行是安全的。
-    
+    # 如果有缓存的负载均衡方案，注入到 DataModule
     if cfg.get("train"):
-        # 重新计算（这次是快速的多进程版本）
         try:
             data_dir = cfg.data.get("data_dir")
             batch_size = cfg.data.get("batch_size", 256)
-             # 计算 World Size
-            if cfg.trainer.get("devices") == "auto":
+            devices = cfg.trainer.get("devices")
+            
+            if devices == "auto":
                 world_size = torch.cuda.device_count()
-            elif isinstance(cfg.trainer.get("devices"), list):
-                world_size = len(cfg.trainer.get("devices"))
-            elif isinstance(cfg.trainer.get("devices"), int):
-                world_size = cfg.trainer.get("devices")
+            elif isinstance(devices, (list, tuple)) or OmegaConf.is_list(devices):
+                world_size = len(devices)
+            elif isinstance(devices, int):
+                world_size = devices
+            elif isinstance(devices, str) and devices.isdigit():
+                world_size = int(devices)
             else:
-                world_size = 1
+                if isinstance(devices, str) and "," in devices:
+                    world_size = len(devices.split(","))
+                else:
+                    world_size = 1
             
-            total_cells, total_steps = get_dataset_stats(
-                root_dir=data_dir,
-                split_label=0, 
-                batch_size=batch_size,
-                num_workers=16, # 适度并发，避免打死文件系统
-                world_size=world_size
-            )
+            cache_key = f"{data_dir}_{batch_size}_{world_size}".replace("/", "_")
+            cache_file = Path(tempfile.gettempdir()) / f"scTFM_stats_{cache_key}.json"
             
-            if total_steps > 0:
-                OmegaConf.set_struct(cfg, False)
-                cfg.trainer.limit_train_batches = total_steps
-                OmegaConf.set_struct(cfg, True)
-                
-        except Exception:
-            pass
+            if cache_file.exists():
+                stats = json.loads(cache_file.read_text())
+                if "assignment" in stats:
+                    # 注入负载均衡方案到配置
+                    # [CRITICAL] 保持字符串 key，因为 Dataset 查找时用 str(global_worker_id)
+                    OmegaConf.set_struct(cfg, False)
+                    cfg.data.shard_assignment = stats["assignment"]  # 保持原始字符串 key
+                    OmegaConf.set_struct(cfg, True)
+                    log.info(f"📥 Loaded shard assignment from cache ({len(stats['assignment'])} workers)")
+        except Exception as e:
+            log.warning(f"Failed to load shard assignment: {e}")
+    
+    datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
 
     # 4. Model
     log.info(f"Instantiating model <{cfg.model._target_}>")

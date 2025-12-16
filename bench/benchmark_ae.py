@@ -69,9 +69,9 @@ def get_best_checkpoint(run_dir):
     ckpts.sort(key=os.path.getmtime)
     return ckpts[-1]
 
-def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096):
+def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096, num_workers=4, prefetch_factor=2):
     """
-    使用 SomaCollectionDataset 构建 DataLoader。
+    使用 SomaCollectionDataset 构建 DataLoader（使用最新优化方案）。
     
     Split Labels:
     0: Train (ID)
@@ -81,6 +81,15 @@ def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096):
     """
     logger.info(f"Setting up dataloaders from {data_dir}...")
     
+    # [优化] 预扫描 shards，避免多个 workers 重复扫描
+    logger.info(f"🔍 Pre-scanning shards...")
+    preloaded_sub_uris = sorted([
+        os.path.join(data_dir, d) 
+        for d in os.listdir(data_dir) 
+        if os.path.isdir(os.path.join(data_dir, d))
+    ])
+    logger.info(f"✅ Found {len(preloaded_sub_uris)} shards (will be shared across all workers)")
+    
     # Test ID (Split 2)
     # 如果没有 Test set，SomaCollectionDataset 会处理为空的情况，但我们需要 catch
     try:
@@ -88,16 +97,18 @@ def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096):
             root_dir=data_dir, 
             split_label=2, # Test ID
             batch_size=batch_size,
-            io_chunk_size=io_chunk_size
+            io_chunk_size=io_chunk_size,
+            preloaded_sub_uris=preloaded_sub_uris  # 传入预扫描结果
         )
         # 检查是否为空 (通过尝试获取一个 iterator，或者直接相信 dataset 内部逻辑)
         # SomaCollectionDataset 是 IterableDataset，len() 不可用
         loader_test_id = DataLoader(
             ds_test_id, 
             batch_size=None, # Dataset handles batching
-            num_workers=4, 
+            num_workers=num_workers, 
             persistent_workers=True, 
-            pin_memory=True
+            pin_memory=True,
+            prefetch_factor=prefetch_factor  # 优化预加载
         )
     except Exception as e:
         logger.warning(f"Failed to load Test ID (Split 2): {e}. Falling back to Validation (Split 1).")
@@ -105,16 +116,18 @@ def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096):
             root_dir=data_dir, 
             split_label=1, # Fallback to Val
             batch_size=batch_size,
-            io_chunk_size=io_chunk_size
+            io_chunk_size=io_chunk_size,
+            preloaded_sub_uris=preloaded_sub_uris
         )
         loader_test_id = DataLoader(
             ds_test_id, 
             batch_size=None, 
-            num_workers=4, 
+            num_workers=num_workers, 
             persistent_workers=True, 
-            pin_memory=True
+            pin_memory=True,
+            prefetch_factor=prefetch_factor
         )
-
+    
     # Test OOD (Split 3)
     loader_ood = None
     try:
@@ -123,18 +136,20 @@ def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096):
             root_dir=data_dir, 
             split_label=3, # Test OOD
             batch_size=batch_size,
-            io_chunk_size=io_chunk_size
+            io_chunk_size=io_chunk_size,
+            preloaded_sub_uris=preloaded_sub_uris
         )
         loader_ood = DataLoader(
             ds_ood, 
             batch_size=None, 
-            num_workers=4, 
+            num_workers=num_workers, 
             persistent_workers=True, 
-            pin_memory=True
+            pin_memory=True,
+            prefetch_factor=prefetch_factor
         )
     except Exception:
         logger.info("No OOD data found or load failed (Split 3). Skipping OOD evaluation.")
-
+        
     return loader_test_id, loader_ood
 
 def evaluate_model(model, dataloader, device, desc="ID"):
@@ -179,6 +194,15 @@ def evaluate_model(model, dataloader, device, desc="ID"):
                 recon_x = res
                 z = torch.zeros(x.shape[0], 64).to(device) # Fallback
             
+            # 检查 NaN/Inf
+            if torch.isnan(recon_x).any() or torch.isinf(recon_x).any():
+                logger.warning(f"Found NaN/Inf in reconstruction, skipping batch")
+                continue
+            
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                logger.warning(f"Found NaN/Inf in input, skipping batch")
+                continue
+            
             # 1. MSE
             loss = torch.nn.functional.mse_loss(recon_x, x, reduction='sum')
             mse_sum += loss.item()
@@ -212,16 +236,18 @@ def evaluate_model(model, dataloader, device, desc="ID"):
             
             latents.append(z.cpu().numpy())
             
-            if len(kept_recon) * dataloader.dataset.batch_size < n_keep:
+            # 修复：kept_recon 中每个元素已经是一个完整 batch，不需要再乘以 batch_size
+            current_kept = sum(arr.shape[0] for arr in kept_recon)
+            if current_kept < n_keep:
                 kept_recon.append(recon_x.cpu().numpy())
                 kept_orig.append(x.cpu().numpy())
                 
     if n_total_cells == 0:
         logger.warning(f"No data found for {desc}")
         return None
-
-    mse = mse_sum / n_elements
-    mean_cell_corr = cell_corr_sum / n_total_cells
+                
+    mse = mse_sum / n_elements if n_elements > 0 else float('nan')
+    mean_cell_corr = cell_corr_sum / n_total_cells if n_total_cells > 0 else float('nan')
     
     # Global Gene Statistics
     mean_orig = (sum_orig / n_total_cells).float()
@@ -230,13 +256,21 @@ def evaluate_model(model, dataloader, device, desc="ID"):
     var_orig = ((sum_sq_orig / n_total_cells) - (mean_orig.double() ** 2)).float()
     var_recon = ((sum_sq_recon / n_total_cells) - (mean_recon.double() ** 2)).float()
     
+    # 避免负方差（数值精度问题）
+    var_orig = torch.clamp(var_orig, min=0.0)
+    var_recon = torch.clamp(var_recon, min=0.0)
+    
     dropout_orig = 1.0 - (sum_gt0_orig / n_total_cells).float()
     dropout_recon = 1.0 - (sum_gt0_recon / n_total_cells).float()
     
     vm_orig = mean_orig - mean_orig.mean()
     vm_recon = mean_recon - mean_recon.mean()
-    gene_mean_corr = (vm_orig * vm_recon).sum() / (torch.sqrt((vm_orig**2).sum()) * torch.sqrt((vm_recon**2).sum()) + 1e-8)
-    gene_mean_corr = gene_mean_corr.item()
+    norm_orig = torch.sqrt((vm_orig**2).sum())
+    norm_recon = torch.sqrt((vm_recon**2).sum())
+    if norm_orig > 1e-8 and norm_recon > 1e-8:
+        gene_mean_corr = ((vm_orig * vm_recon).sum() / (norm_orig * norm_recon)).item()
+    else:
+        gene_mean_corr = float('nan')
     
     latents = np.concatenate(latents, axis=0)
     
@@ -359,8 +393,10 @@ def plot_gene_corr_scatter(orig_data, recon_data, title_suffix="", save_path=Non
         plt.savefig(save_path)
         plt.close()
 
-def run_benchmark(run_dir, wandb_base_cfg):
-    logger.info(f"Processing run: {run_dir}")
+def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
+    logger.info(f"{'='*80}")
+    logger.info(f"📊 Processing run [{run_idx}/{total_runs}]: {run_dir}")
+    logger.info(f"{'='*80}")
     
     cfg_path = os.path.join(run_dir, ".hydra", "config.yaml")
     cfg = OmegaConf.load(cfg_path)
@@ -375,35 +411,45 @@ def run_benchmark(run_dir, wandb_base_cfg):
             
     ckpt_path = get_best_checkpoint(run_dir)
     if not ckpt_path:
-        logger.warning(f"No checkpoint found in {run_dir}, skipping.")
+        logger.warning(f"❌ No checkpoint found in {run_dir}, skipping.")
         return
     
-    logger.info(f"Found checkpoint: {ckpt_path}")
+    logger.info(f"✅ Found checkpoint: {ckpt_path}")
     
+    logger.info(f"⚙️  Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net_cfg = cfg.model.net
     net = instantiate(net_cfg)
     model = AELitModule.load_from_checkpoint(ckpt_path, net=net, optimizer=None, scheduler=None, map_location=device)
     model.to(device)
     model.eval()
+    logger.info(f"✅ Model loaded on {device}")
     
     # 4. 准备数据
+    logger.info(f"📦 Preparing dataloaders...")
     # 从 cfg.data.data_dir 获取路径，或者使用默认的
     data_dir = cfg.data.get("data_dir", "/fast/data/scTFM/ae/tileDB/all_data") # 默认 fallback
     batch_size = 2048
     io_chunk_size = cfg.data.get("io_chunk_size", 4096)
+    num_workers = cfg.data.get("num_workers", 4)
+    prefetch_factor = cfg.data.get("prefetch_factor", 2)
     
-    loader_id, loader_ood = setup_dataloaders(data_dir, batch_size=batch_size, io_chunk_size=io_chunk_size)
+    loader_id, loader_ood = setup_dataloaders(
+        data_dir, 
+        batch_size=batch_size, 
+        io_chunk_size=io_chunk_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor
+    )
     
     # 5. WandB Init
+    logger.info(f"🔗 Initializing W&B...")
     wandb_cfg = OmegaConf.load(wandb_base_cfg)
     run_name = f"bench_{os.path.basename(run_dir)}_{cfg.model.net.get('_target_', 'ae').split('.')[-1]}"
     
     # Clean config
     for key in ["callbacks", "trainer", "logger", "hydra"]:
         if key in cfg:
-            with open(os.devnull, "w") as f: 
-                pass
             try:
                 del cfg[key]
             except Exception:
@@ -419,8 +465,10 @@ def run_benchmark(run_dir, wandb_base_cfg):
         tags=["benchmark"],
         reinit=True
     )
+    logger.info(f"✅ W&B run: {run.name}")
     
     # 6. Eval ID
+    logger.info(f"🧪 Evaluating on ID Test set...")
     res_id = evaluate_model(model, loader_id, device, desc="ID Test")
     if res_id:
         wandb.log({
@@ -428,11 +476,15 @@ def run_benchmark(run_dir, wandb_base_cfg):
             "eval/id_cell_corr": res_id['mean_cell_corr'],
             "eval/id_gene_corr": res_id['gene_mean_corr']
         })
-        logger.info(f"ID MSE: {res_id['mse']:.6f}, Cell Corr: {res_id['mean_cell_corr']:.4f}, Gene Mean Corr: {res_id['gene_mean_corr']:.4f}")
+        logger.info(f"✅ ID Results - MSE: {res_id['mse']:.6f}, Cell Corr: {res_id['mean_cell_corr']:.4f}, Gene Mean Corr: {res_id['gene_mean_corr']:.4f}")
+        logger.info(f"📊 Generating ID plots...")
         generate_plots(res_id, "id")
+        logger.info(f"✅ ID plots generated")
     
     # 7. Eval OOD
-    if loader_ood:
+    # 修复：IterableDataset 没有 __len__，使用 is not None 判断
+    if loader_ood is not None:
+        logger.info(f"🧪 Evaluating on OOD Test set...")
         res_ood = evaluate_model(model, loader_ood, device, desc="OOD Test")
         if res_ood:
             wandb.log({
@@ -440,48 +492,65 @@ def run_benchmark(run_dir, wandb_base_cfg):
                 "eval/ood_cell_corr": res_ood['mean_cell_corr'],
                 "eval/ood_gene_corr": res_ood['gene_mean_corr']
             })
-            logger.info(f"OOD MSE: {res_ood['mse']:.6f}, Cell Corr: {res_ood['mean_cell_corr']:.4f}, Gene Mean Corr: {res_ood['gene_mean_corr']:.4f}")
+            logger.info(f"✅ OOD Results - MSE: {res_ood['mse']:.6f}, Cell Corr: {res_ood['mean_cell_corr']:.4f}, Gene Mean Corr: {res_ood['gene_mean_corr']:.4f}")
+            logger.info(f"📊 Generating OOD plots...")
             generate_plots(res_ood, "ood")
+            logger.info(f"✅ OOD plots generated")
     
     # 8. Latent Vis
-    if res_id:
-        latents_id = res_id['latents']
-        labels = ["ID"] * len(latents_id)
-        all_latents = latents_id
-        
-        if loader_ood and res_ood:
-            latents_ood = res_ood['latents']
-            all_latents = np.concatenate([latents_id, latents_ood], axis=0)
-            labels += ["OOD"] * len(latents_ood)
-        
-        # Subsample for plot
-        max_plot = 10000
-        if len(all_latents) > max_plot:
-            idx = np.random.choice(len(all_latents), max_plot, replace=False)
-            all_latents = all_latents[idx]
-            labels = np.array(labels)[idx]
-        
-        adata_vis = sc.AnnData(X=all_latents)
-        adata_vis.obs['condition'] = labels
-        
-        logger.info("Computing UMAP...")
-        sc.tl.pca(adata_vis)
-        sc.pp.neighbors(adata_vis)
-        sc.tl.umap(adata_vis)
-        
-        fig, ax = plt.subplots(figsize=(8, 8))
-        sc.pl.umap(adata_vis, color='condition', ax=ax, show=False, title="Latent Space: ID vs OOD", frameon=False)
-        fig_path_umap = "latent_umap.png"
-        plt.savefig(fig_path_umap, bbox_inches='tight')
-        plt.close()
-        
-        wandb.log({"plots/latent_umap": wandb.Image(fig_path_umap)})
-        os.remove(fig_path_umap)
+    if not res_id:
+        logger.warning("⚠️  No ID results available for latent visualization, skipping.")
+        wandb.finish()
+        return
     
+    logger.info(f"🎨 Generating latent space visualization...")
+    latents_id = res_id['latents']
+    labels = ["ID"] * len(latents_id)
+    all_latents = latents_id
+    
+    # 修复：使用 is not None 判断
+    if loader_ood is not None and res_ood:
+        latents_ood = res_ood['latents']
+        all_latents = np.concatenate([latents_id, latents_ood], axis=0)
+        labels += ["OOD"] * len(latents_ood)
+
+    # Subsample for plot
+    max_plot = 10000
+    if len(all_latents) > max_plot:
+        idx = np.random.choice(len(all_latents), max_plot, replace=False)
+        all_latents = all_latents[idx]
+        labels = np.array(labels)[idx]
+    
+    adata_vis = sc.AnnData(X=all_latents)
+    adata_vis.obs['condition'] = labels
+    
+    logger.info("   Computing PCA...")
+    sc.tl.pca(adata_vis)
+    logger.info("   Computing neighbors...")
+    sc.pp.neighbors(adata_vis)
+    logger.info("   Computing UMAP...")
+    sc.tl.umap(adata_vis)
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sc.pl.umap(adata_vis, color='condition', ax=ax, show=False, title="Latent Space: ID vs OOD", frameon=False)
+    fig_path_umap = "latent_umap.png"
+    plt.savefig(fig_path_umap, bbox_inches='tight')
+    plt.close()
+    
+    wandb.log({"plots/latent_umap": wandb.Image(fig_path_umap)})
+    os.remove(fig_path_umap)
+    logger.info(f"✅ Latent visualization complete")
+    
+    logger.info(f"🏁 Benchmark complete for run [{run_idx}/{total_runs}]")
     wandb.finish()
 
 def generate_plots(res, suffix):
     stats = res['stats']
+    
+    # 检查样本是否为空
+    if res['orig_sample'] is None or len(res['orig_sample']) == 0:
+        logger.warning(f"⚠️  No samples available for {suffix} plots, skipping.")
+        return
     
     fig_mean = f"recon_mean_{suffix}.png"
     plot_reconstruction(res['orig_sample'], res['recon_sample'], title_suffix=suffix, save_path=fig_mean)
@@ -516,17 +585,24 @@ def main():
     args = parser.parse_args()
     
     if not os.path.exists(args.dir):
-        logger.error(f"Directory not found: {args.dir}")
+        logger.error(f"❌ Directory not found: {args.dir}")
         sys.exit(1)
         
     runs = find_runs(args.dir)
-    logger.info(f"Found {len(runs)} runs to benchmark.")
+    logger.info(f"🚀 Found {len(runs)} runs to benchmark.")
+    logger.info(f"{'='*80}\n")
     
-    for run in runs:
+    for idx, run in enumerate(runs, start=1):
         try:
-            run_benchmark(run, args.wandb_config)
+            run_benchmark(run, args.wandb_config, run_idx=idx, total_runs=len(runs))
+            logger.info(f"\n")
         except Exception as e:
-            logger.error(f"Failed to benchmark run {run}: {e}", exc_info=True)
+            logger.error(f"❌ Failed to benchmark run {run}: {e}", exc_info=True)
+            logger.info(f"\n")
+    
+    logger.info(f"{'='*80}")
+    logger.info(f"🎉 All benchmarks completed! Total runs: {len(runs)}")
+    logger.info(f"{'='*80}")
 
 if __name__ == "__main__":
     main()

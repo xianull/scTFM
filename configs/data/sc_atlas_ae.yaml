@@ -9,7 +9,7 @@ batch_size: 512
 
 # DataLoader 参数
 # [关键] 8卡DDP下总并发=8*4=32。解决 GPFS I/O 拥塞的最佳实践。
-num_workers: 16    
+num_workers: 8    
 
 # 是否锁页内存，通常为 True 以加速 host 到 device 的传输
 pin_memory: True

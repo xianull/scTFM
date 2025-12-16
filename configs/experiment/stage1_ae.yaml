@@ -36,6 +36,6 @@ hydra:
       # 修正：使用字符串格式，并用引号包裹整个列表，防止内部逗号被误分割
       # 注意：不要在列表内部使用空格，确保 Hydra 解析正确
       model.net.hidden_dims: "[4096,2048,2048,1024,1024,512],[8192,4096,2048,2048,1024,1024,512]"
-      model.net.activation: "GELU, SwiGLU"
+      model.net.activation: "SwiGLU, GELU"
       # 修正：使用逗号分隔的字符串
       model.net.latent_dim: 512

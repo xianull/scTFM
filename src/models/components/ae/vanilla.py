@@ -60,21 +60,11 @@ class VanillaAE(nn.Module):
         for h_dim in hidden_dims:
             if activation == "SwiGLU":
                 # SwiGLU replaces (Linear + Activation)
-                # Note: BatchNorm usually comes AFTER linear projection but BEFORE activation in standard ResNet
-                # In SwiGLU, the "activation" is built-in.
-                # Standard Pre-Norm Transformer: Norm -> Linear -> SwiGLU
-                # Standard Post-Norm: Linear -> SwiGLU -> Norm
-                # Here we follow the existing pattern: Linear -> BN -> Act -> Dropout
-                # SwiGLU combines Linear + Act.
-                # So we do: SwiGLU(in->out) -> BN -> Dropout? 
-                # Or SwiGLU includes the "Linear" part.
-                # Let's use: SwiGLU(curr -> h) -> BN -> Dropout.
-                
                 encoder_layers.append(SwiGLU(curr_dim, h_dim))
                 if use_batch_norm:
                     encoder_layers.append(nn.BatchNorm1d(h_dim))
-                # No separate activation layer needed
             else:
+                # Standard: Linear -> BN -> Activation
                 encoder_layers.append(nn.Linear(curr_dim, h_dim))
                 if use_batch_norm:
                     encoder_layers.append(nn.BatchNorm1d(h_dim))
@@ -102,7 +92,7 @@ class VanillaAE(nn.Module):
                 if use_batch_norm:
                     decoder_layers.append(nn.BatchNorm1d(h_dim))
                 decoder_layers.append(get_activation(activation))
-                
+            
             decoder_layers.append(nn.Dropout(dropout_rate))
             curr_dim = h_dim
 
