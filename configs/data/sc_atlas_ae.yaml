@@ -1,7 +1,7 @@
 _target_: src.data.sc_datamodule.SingleCellDataModule
 
 # 数据存储路径
-data_dir: /fast/data/scTFM/ae/tile_4000_fix/
+data_dir: /fast/data/scTFM/ae/tiledb_all/
 
 # 传递给 SomaCollectionDataset 的 batch_size
 # 因为我们在 Dataset 内部做 batching，所以这个参数控制的是 yield 出的 tensor 大小

@@ -1,0 +1,16 @@
+# Flow Matching (Conditional Flow Matching) 配置
+
+# Flow 类型
+flow_type: flow_matching
+
+# Flow Matching 特定参数
+sigma_min: 0.001  # 最小噪声水平
+sigma_max: 0.1    # 最大噪声水平
+
+# 描述
+_description: >
+  Flow Matching (ICLR 2023): 基于条件概率路径的 Flow 模型。
+  - 支持可学习的时间依赖方差
+  - 更好的轨迹平滑性
+  - 适合复杂分布建模
+

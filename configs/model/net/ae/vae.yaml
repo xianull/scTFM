@@ -1,8 +1,14 @@
 _target_: src.models.components.ae.vae.VariationalAE
 
-input_dim: 19138  # 根据实际基因数量调整
-hidden_dims: [2048, 1024, 512]
-latent_dim: 64
-dropout_rate: 0.1
-use_batch_norm: True
-activation: "GELU" # LeakyReLU, GELU, SiLU, ReLU
+# ==================== 网络结构参数 ====================
+input_dim: 28231  # 根据实际基因数量调整
+hidden_dims: [2048, 1024, 512]  # Encoder 隐藏层维度 (Decoder 自动镜像)
+latent_dim: 64  # 潜在空间维度
+
+# ==================== 正则化参数 ====================
+dropout_rate: 0.1  # Dropout 比例 (0.0-0.5)
+use_batch_norm: True  # 是否使用 Batch/Layer Normalization
+
+# ==================== 激活函数 ====================
+activation: "GELU"  # 激活函数: LeakyReLU, GELU, SiLU, ReLU, SwiGLU
+# 注意: SwiGLU 会自动使用 LayerNorm 而非 BatchNorm

@@ -4,16 +4,28 @@ import torch.nn.functional as F
 
 class SwiGLU(nn.Module):
     """
-    SwiGLU Activation Module.
+    SwiGLU Activation Module (Fixed for numerical stability).
     """
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         self.linear = nn.Linear(in_features, 2 * out_features, bias=bias)
+        
+        # ✅ 修复1：使用 Xavier 初始化
+        nn.init.xavier_uniform_(self.linear.weight, gain=0.5)
+        if bias:
+            nn.init.zeros_(self.linear.bias)
+        
+        self.scale = (2 * out_features) ** -0.5
 
     def forward(self, x):
         x = self.linear(x)
         x1, x2 = x.chunk(2, dim=-1)
-        return x1 * F.silu(x2)
+        
+        # ✅ 修复2：数值裁剪，防止 NaN
+        x2 = torch.clamp(x2, min=-20, max=20)
+        
+        out = x1 * F.silu(x2)
+        return out
 
 def get_activation(name: str):
     """Factory for activation functions"""
@@ -52,9 +64,10 @@ class VariationalAE(nn.Module):
         
         for h_dim in hidden_dims:
             if activation == "SwiGLU":
-                encoder_layers.append(SwiGLU(curr_dim, h_dim))
+                # ✅ 修复：LayerNorm 在 SwiGLU 之前
                 if use_batch_norm:
-                    encoder_layers.append(nn.BatchNorm1d(h_dim))
+                    encoder_layers.append(nn.LayerNorm(curr_dim))
+                encoder_layers.append(SwiGLU(curr_dim, h_dim))
             else:
                 encoder_layers.append(nn.Linear(curr_dim, h_dim))
                 if use_batch_norm:
@@ -79,9 +92,10 @@ class VariationalAE(nn.Module):
         
         for h_dim in reversed_hidden:
             if activation == "SwiGLU":
-                decoder_layers.append(SwiGLU(curr_dim, h_dim))
+                # ✅ 修复：LayerNorm 在 SwiGLU 之前
                 if use_batch_norm:
-                    decoder_layers.append(nn.BatchNorm1d(h_dim))
+                    decoder_layers.append(nn.LayerNorm(curr_dim))
+                decoder_layers.append(SwiGLU(curr_dim, h_dim))
             else:
                 decoder_layers.append(nn.Linear(curr_dim, h_dim))
                 if use_batch_norm:

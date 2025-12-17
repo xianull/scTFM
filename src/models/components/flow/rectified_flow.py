@@ -3,16 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, Tuple, Optional
 
-class RectifiedFlow(nn.Module):
+from src.models.components.flow.base_flow import BaseFlow
+
+class RectifiedFlow(BaseFlow):
     """
     Rectified Flow (Reflow) 核心逻辑实现。
     
     Paper: Flow Straight and Fast: Learning to Generate with Rectified Flow (ICLR 2023)
     Target: 学习从 Source Distribution (x0) 到 Target Distribution (x1) 的直线轨迹。
+    
+    核心思想：
+    - z_t = t * x1 + (1-t) * x0 (线性插值)
+    - v_target = x1 - x0 (恒定速度)
+    - Loss = MSE(v_pred, v_target)
     """
     def __init__(self, backbone: nn.Module):
-        super().__init__()
-        self.backbone = backbone
+        super().__init__(backbone)
 
     def forward(self, x1: torch.Tensor, cond_data: Dict[str, Any] = None) -> torch.Tensor:
         """

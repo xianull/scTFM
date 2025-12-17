@@ -1,0 +1,37 @@
+# @package _global_
+
+defaults:
+  - override /data: sc_atlas_ae
+  - override /model: ae_stage1_vae  # 默认
+  - override /trainer: default
+
+task_name: "vae_variants_1216"
+
+tags: ["vae", "variants_comparison", "1216"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 10
+  gradient_clip_val: 0.5
+
+model:
+  optimizer:
+    lr: 1e-4
+
+logger:
+  wandb:
+    group: "vae_variants"
+    name: "${model._target_}_${hydra:job.num}"
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # 对比不同的模型配置
+      model: ae_stage1_vae,ae_stage1_beta_vae,ae_stage1_vanilla
+      
+      # 同时测试不同的网络架构
+      model.net/ae: vae,vae_beta,vae_lightweight
+

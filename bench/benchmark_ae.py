@@ -458,7 +458,7 @@ def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
     config_dict = OmegaConf.to_container(cfg, resolve=True)
     
     run = wandb.init(
-        project=wandb_cfg.get("project", "scTime-AE-bench"),
+        project=wandb_cfg.get("project", "scTime-AE-bench-1217"),
         name=run_name,
         config=config_dict,
         job_type="benchmark",

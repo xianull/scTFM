@@ -1,0 +1,12 @@
+# Rectified Flow 配置
+
+# Flow 类型
+flow_type: rectified_flow
+
+# 描述
+_description: >
+  Rectified Flow (ICLR 2023): 学习从噪声到数据的直线轨迹。
+  - 最简单、最快的 Flow 模型
+  - 训练稳定，采样快速
+  - 推荐作为 Baseline
+

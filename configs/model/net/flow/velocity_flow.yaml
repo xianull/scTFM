@@ -1,0 +1,12 @@
+# Velocity Flow 配置
+
+# Flow 类型
+flow_type: velocity_flow
+
+# 描述
+_description: >
+  Velocity Flow: 直接学习速度场的 Flow 模型。
+  - 更关注轨迹的动力学特性
+  - 适合建模细胞轨迹
+  - 可能需要更多训练步数
+

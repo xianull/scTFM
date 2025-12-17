@@ -1,0 +1,39 @@
+# @package _global_
+
+defaults:
+  - override /data: sc_atlas_ae
+  - override /model: ae_stage1_vanilla  # 默认使用 vanilla
+  - override /trainer: default
+
+task_name: "ae_stage1_models_sweep"
+
+tags: ["ae", "model_comparison", "1216"]
+
+seed: 12345
+
+trainer:
+  min_epochs: 1
+  max_epochs: 10
+  gradient_clip_val: 0.5
+
+model:
+  optimizer:
+    lr: 1e-4
+  net:
+    latent_dim: 64
+
+logger:
+  wandb:
+    group: "ae_models_sweep"
+    name: "${model._target_}_latent${model.net.latent_dim}_${hydra:job.num}"
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # ✅ 方案B：切换不同的模型配置文件
+      model: ae_stage1_vanilla,ae_stage1_vae
+      
+      # 可选：同时 sweep latent_dim
+      model.net.latent_dim: 64,128,512
+

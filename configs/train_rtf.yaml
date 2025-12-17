@@ -1,0 +1,69 @@
+# RTF (Rectified Flow) 训练配置模板
+
+# @package _global_
+
+defaults:
+  - _self_
+  - data: rtf_tedd  # RTF 数据集
+  - model: flow_stage2  # Flow 模型
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
+  - paths: default
+  - extras: default
+  - hydra: default
+
+# Task 名称
+task_name: "rtf_train"
+
+# 标签
+tags: ["rtf", "flow", "cell_trajectory"]
+
+# Seed
+seed: 42
+
+# WandB 配置
+logger:
+  wandb:
+    project: "scTFM-RTF"
+    name: "${task_name}_${model.mode}_${model.flow_type}"
+    tags: ${tags}
+
+# Trainer 配置
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: [0,1,2,3,4,5,6,7]
+  strategy: ddp
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+
+# ===================================================================
+# 快速启动指南
+# ===================================================================
+
+# 1. Latent Mode (默认，推荐)
+# python src/train.py -cn train_rtf model.mode=latent
+
+# 2. Raw Mode
+# python src/train.py -cn train_rtf model.mode=raw
+
+# 3. 切换 Flow 类型
+# python src/train.py -cn train_rtf model.flow_type=flow_matching
+
+# 4. 切换方向（时间正向/逆向）
+# python src/train.py -cn train_rtf data.direction=backward
+
+# 5. 组合使用
+# python src/train.py -cn train_rtf \
+#   model.mode=latent \
+#   model.flow_type=velocity_flow \
+#   data.direction=both \
+#   data.batch_size=256
+
+# 6. 多卡训练
+# python src/train.py -cn train_rtf \
+#   trainer.devices=[0,1,2,3] \
+#   data.num_workers=8 \
+#   model.mode=latent
+

@@ -146,31 +146,73 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x, t, cond_data):
-        # x: (N, input_dim)
-        # t: (N,)
+    def forward(self, x, t, cond_data=None):
+        """
+        前向传播。
         
+        Args:
+            x: 输入数据 (N, input_dim)
+            t: 时间步 (N,)
+            cond_data: 条件信息字典（可选）
+                - x_curr: 当前细胞状态 (N, input_dim)
+                - time_curr: 当前时间 (N,) 或 'time'
+                - delta_t: 时间差 (N,) 或 'dt'
+                - tissue: 组织ID (N,) [可选]
+                - celltype: 细胞类型ID (N,) [可选]
+        
+        Returns:
+            v_pred: 预测的速度场 (N, input_dim)
+        """
         # 1. Embed Input -> (N, 1, D)
-        x = self.x_embedder(x).unsqueeze(1)
+        x_emb = self.x_embedder(x).unsqueeze(1)
         
-        # 2. Embed Conditions
+        # 2. Embed Flow Time
         t_emb = self.t_embedder(t)
         
-        c_tissue = self.tissue_emb(cond_data['tissue'])
-        c_ctype = self.celltype_emb(cond_data['celltype'])
-        c_xcurr = self.x_curr_embedder(cond_data['x_curr'])
-        c_abs_time = self.abs_time_embedder(cond_data['time'])
-        c_dt = self.dt_embedder(cond_data['dt'])
+        # 3. Embed Conditions (灵活处理可能缺失的键)
+        c = t_emb  # 基础条件
         
-        # Simple Additive Conditioning
-        c = t_emb + c_tissue + c_ctype + c_xcurr + c_abs_time + c_dt
-        
-        # 3. Transformer Blocks
-        for block in self.blocks:
-            x = block(x, c)
+        if cond_data is not None:
+            # x_curr (当前细胞状态)
+            if 'x_curr' in cond_data:
+                c_xcurr = self.x_curr_embedder(cond_data['x_curr'])
+                c = c + c_xcurr
             
-        # 4. Final Layer
-        x = self.final_layer(x, c)
+            # 绝对时间 (支持 'time_curr' 或 'time')
+            time_key = 'time_curr' if 'time_curr' in cond_data else 'time'
+            if time_key in cond_data:
+                c_abs_time = self.abs_time_embedder(cond_data[time_key])
+                c = c + c_abs_time
+            
+            # 时间差 (支持 'delta_t' 或 'dt')
+            dt_key = 'delta_t' if 'delta_t' in cond_data else 'dt'
+            if dt_key in cond_data:
+                c_dt = self.dt_embedder(cond_data[dt_key])
+                c = c + c_dt
+            
+            # 组织 (可选)
+            if 'tissue' in cond_data:
+                tissue_ids = cond_data['tissue']
+                # 处理非整数情况（例如字符串或缺失值）
+                if not torch.is_tensor(tissue_ids):
+                    tissue_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+                c_tissue = self.tissue_emb(tissue_ids)
+                c = c + c_tissue
+            
+            # 细胞类型 (可选)
+            if 'celltype' in cond_data:
+                celltype_ids = cond_data['celltype']
+                if not torch.is_tensor(celltype_ids):
+                    celltype_ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+                c_ctype = self.celltype_emb(celltype_ids)
+                c = c + c_ctype
         
-        return x.squeeze(1)
+        # 4. Transformer Blocks
+        for block in self.blocks:
+            x_emb = block(x_emb, c)
+            
+        # 5. Final Layer
+        v_pred = self.final_layer(x_emb, c)
+        
+        return v_pred.squeeze(1)
 

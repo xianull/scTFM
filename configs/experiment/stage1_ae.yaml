@@ -13,7 +13,7 @@ seed: 12345
 
 trainer:
   min_epochs: 1
-  max_epochs: 2
+  max_epochs: 5
   gradient_clip_val: 0.5
 
 model:
@@ -27,15 +27,15 @@ model:
 logger:
   wandb:
     group: "ae_stage1_sweep"
-    name: "ae_stage1_${hydra:job.num}"
+    name: "ae_stage1_${model.net._target_}_${hydra:job.num}"  # 在名称中包含 net 类型
 
 hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      # 修正：使用字符串格式，并用引号包裹整个列表，防止内部逗号被误分割
-      # 注意：不要在列表内部使用空格，确保 Hydra 解析正确
-      model.net.hidden_dims: "[4096,2048,2048,1024,1024,512],[8192,4096,2048,2048,1024,1024,512]"
-      model.net.activation: "SwiGLU, GELU"
-      # 修正：使用逗号分隔的字符串
-      model.net.latent_dim: 512
+      # 方法1：直接覆盖配置组（推荐）
+      # 这会切换 /model/net/ae/ 下的不同配置文件
+      model/net/ae@model.net: vae,vanilla
+      
+      # 方法2：同时 sweep 其他超参数
+      model.net.hidden_dims: "[4096,2048,1024,512],[8192,4096,2048,1024,512]"

@@ -25,7 +25,7 @@ class SomaCollectionDataset(IterableDataset):
         
         if not os.path.exists(root_dir):
              raise ValueError(f"❌ 路径不存在: {root_dir}")
-    
+
     @property
     def sub_uris(self):
         """延迟加载 Shards 列表（如果 DataModule 没有预扫描）"""
@@ -35,27 +35,27 @@ class SomaCollectionDataset(IterableDataset):
                 os.path.join(self.root_dir, d) 
                 for d in os.listdir(self.root_dir) 
                 if os.path.isdir(os.path.join(self.root_dir, d))
-            ])
-            
+        ])
+        
             if len(self._sub_uris) == 0:
                 raise ValueError(f"❌ 路径 {self.root_dir} 下没有发现子文件夹！")
-        
+
         return self._sub_uris
     
     @property
     def n_vars(self):
         """延迟加载特征维度（只在第一次真正需要时才读取元数据）"""
         if self._n_vars is None:
-            tmp_ctx = tiledbsoma.SOMATileDBContext()
-            try:
-                with tiledbsoma.Experiment.open(self.sub_uris[0], context=tmp_ctx) as exp:
+        tmp_ctx = tiledbsoma.SOMATileDBContext()
+        try:
+            with tiledbsoma.Experiment.open(self.sub_uris[0], context=tmp_ctx) as exp:
                     self._n_vars = exp.ms[self.measurement_name].var.count
-            except Exception:
-                if len(self.sub_uris) > 1:
-                    with tiledbsoma.Experiment.open(self.sub_uris[1], context=tmp_ctx) as exp:
+        except Exception:
+            if len(self.sub_uris) > 1:
+                with tiledbsoma.Experiment.open(self.sub_uris[1], context=tmp_ctx) as exp:
                         self._n_vars = exp.ms[self.measurement_name].var.count
-                else:
-                    raise
+            else:
+                raise
         
         return self._n_vars
 

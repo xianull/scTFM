@@ -4,24 +4,47 @@ import torch.nn.functional as F
 
 class SwiGLU(nn.Module):
     """
-    SwiGLU Activation Module.
+    SwiGLU Activation Module (Fixed for numerical stability).
     Accepts input of dimension 'in_features', projects to 2 * 'out_features',
     and applies SwiGLU: (xW + b) * SiLU(xV + c).
     
     This replaces the standard (Linear -> Activation) block.
+    
+    Improvements:
+    - Xavier initialization for better gradient flow
+    - Optional scaling factor to prevent overflow
+    - Gradient clipping in extreme cases
     """
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
         # We need 2 * out_features for the gating mechanism
         self.linear = nn.Linear(in_features, 2 * out_features, bias=bias)
+        
+        # ✅ 修复1：使用 Xavier/Glorot 初始化，保证数值稳定
+        nn.init.xavier_uniform_(self.linear.weight, gain=0.5)  # 使用较小的 gain
+        if bias:
+            nn.init.zeros_(self.linear.bias)
+        
+        # ✅ 修复2：添加缩放因子（参考 GLU 论文）
+        self.scale = (2 * out_features) ** -0.5
 
     def forward(self, x):
         # Project to 2 * hidden
         x = self.linear(x)
         # Split into two halves
         x1, x2 = x.chunk(2, dim=-1)
-        # SwiGLU: x1 * SiLU(x2) (or vice versa, symmetric)
-        return x1 * F.silu(x2)
+        
+        # ✅ 修复3：添加数值稳定性检查
+        # 在 SiLU 之前进行裁剪，防止过大的输入
+        x2 = torch.clamp(x2, min=-20, max=20)
+        
+        # SwiGLU: x1 * SiLU(x2)
+        out = x1 * F.silu(x2)
+        
+        # ✅ 修复4：应用缩放（可选，防止梯度爆炸）
+        # out = out * self.scale
+        
+        return out
 
 def get_activation(name: str):
     """Factory for activation functions"""
@@ -59,10 +82,11 @@ class VanillaAE(nn.Module):
 
         for h_dim in hidden_dims:
             if activation == "SwiGLU":
-                # SwiGLU replaces (Linear + Activation)
-                encoder_layers.append(SwiGLU(curr_dim, h_dim))
+                # ✅ 修复：SwiGLU 使用 LayerNorm（在之前），更稳定
+                # 标准架构：LayerNorm -> SwiGLU -> Dropout
                 if use_batch_norm:
-                    encoder_layers.append(nn.BatchNorm1d(h_dim))
+                    encoder_layers.append(nn.LayerNorm(curr_dim))
+                encoder_layers.append(SwiGLU(curr_dim, h_dim))
             else:
                 # Standard: Linear -> BN -> Activation
                 encoder_layers.append(nn.Linear(curr_dim, h_dim))
@@ -84,9 +108,10 @@ class VanillaAE(nn.Module):
         curr_dim = latent_dim
         for h_dim in reversed_hidden:
             if activation == "SwiGLU":
-                decoder_layers.append(SwiGLU(curr_dim, h_dim))
+                # ✅ 修复：SwiGLU 使用 LayerNorm（在之前）
                 if use_batch_norm:
-                    decoder_layers.append(nn.BatchNorm1d(h_dim))
+                    decoder_layers.append(nn.LayerNorm(curr_dim))
+                decoder_layers.append(SwiGLU(curr_dim, h_dim))
             else:
                 decoder_layers.append(nn.Linear(curr_dim, h_dim))
                 if use_batch_norm:
