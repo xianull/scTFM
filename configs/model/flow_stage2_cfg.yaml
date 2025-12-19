@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - net/backbone@model.net: dit
+  - net/backbone@model.net: dit_cross_attn  # 使用 Cross-Attention backbone
   - _self_
 
 model:
@@ -18,8 +18,6 @@ model:
   # ===================================================================
   # [Latent 模式配置] AE Checkpoint 路径
   # ===================================================================
-  # 当 mode=latent 时，如果 latent 数据不存在，系统会自动使用此 checkpoint 提取
-  # 设置为 null 则禁用自动提取功能
   ae_ckpt_path: null  # 示例: "logs/ae_stage1/checkpoints/best.ckpt"
 
   # 优化器
@@ -35,37 +33,21 @@ model:
     _partial_: true
     mode: min
     factor: 0.5
-    patience: 3
+    patience: 5
 
 # ===================================================================
-# [自动配置] 根据 mode 自动调整参数
+# 与 flow_stage2.yaml 的区别
 # ===================================================================
-
-# Latent Mode (mode=latent)
-# - model.net.input_dim: 64 (AE 潜在维度)
-# - data.latent_key: "X_latent"
-# - data.batch_size: 512 (可以更大)
-
-# Raw Mode (mode=raw)
-# - model.net.input_dim: 28231 (基因数量)
-# - data.latent_key: null
-# - data.batch_size: 128 (显存限制)
-
-# ===================================================================
-# 使用示例
-# ===================================================================
-
-# 1. Latent Mode (默认，推荐)
-# python src/train.py model=flow_stage2 model.mode=latent
-
-# 2. Raw Mode
-# python src/train.py model=flow_stage2 model.mode=raw
-
-# 3. 切换 Flow 类型
-# python src/train.py model=flow_stage2 model.flow_type=flow_matching
-
-# 4. 组合使用
-# python src/train.py model=flow_stage2 \
-#   model.mode=raw \
-#   model.flow_type=velocity_flow \
-#   data.batch_size=64
+#
+# 1. 使用 DiTCrossAttn backbone:
+#    - x_curr 通过 Cross-Attention 注入（强条件）
+#    - 其他条件（t, time_curr, tissue, celltype）通过 adaLN 注入
+#
+# 2. 支持 Classifier-Free Guidance (CFG):
+#    - 训练时: 随机 drop x_curr 条件 (cond_dropout)
+#    - 采样时: 可设置 cfg_scale > 1.0 增强条件影响
+#
+# 3. 预期改进:
+#    - 更好地利用 x_curr 信息预测 x_next
+#    - 避免模式崩塌（mode collapse）
+#    - CFG 可在采样时进一步增强条件控制

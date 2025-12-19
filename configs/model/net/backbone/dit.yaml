@@ -3,6 +3,7 @@ input_dim: 64 # [关键] 根据模式修改: 64 (Latent) 或 19138 (Raw)
 hidden_size: 512
 depth: 12
 num_heads: 8
-n_tissues: 50
-n_celltypes: 100
+# 条件 Embedding 维度（根据 TEDD 数据集实际类别数量）
+n_tissues: 12      # 11 种 + 1 (Unknown)
+n_celltypes: 62    # 61 种 + 1 (Unknown)
 cond_dropout: 0.1

@@ -8,12 +8,13 @@ from src.data.components.rtf_dataset import SomaRTFDataset
 class RTFDataModule(LightningDataModule):
     """
     用于 Rectified Flow 训练的 LightningDataModule。
-    
+
     特点：
     1. 支持 Latent 和 Raw 两种模式（通过 latent_key 控制）
     2. 集成智能负载均衡（shard_assignment）
     3. 支持多方向细胞对（forward/backward/both）
-    
+    4. 支持时间归一化和 Stage 映射
+
     参数:
         data_dir: TileDB SOMA 根目录
         batch_size: 批次大小
@@ -27,6 +28,8 @@ class RTFDataModule(LightningDataModule):
         latent_key: 潜在空间键名 (None=Raw, "X_latent"=Latent)
         direction: 细胞对方向 ('forward', 'backward', 'both')
         shard_assignment: 智能负载均衡方案（由 train.py 注入）
+        stage_info_path: Stage 信息 CSV 路径
+        use_log_time: 是否使用 log-scale 时间归一化
     """
 
     def __init__(
@@ -43,9 +46,14 @@ class RTFDataModule(LightningDataModule):
         latent_key: Optional[str] = None,  # 关键：控制 Latent 还是 Raw
         direction: str = "forward",
         shard_assignment: Optional[Dict[str, Any]] = None,
+        stage_info_path: Optional[str] = None,  # Stage 信息 CSV 路径
+        use_log_time: bool = True,  # 是否使用 log-scale 时间归一化
+        # 以下参数由 train.py 使用，DataModule 不需要
+        raw_data_dir: Optional[str] = None,  # 仅供 train.py 推理 latent 目录
+        latent_dir: Optional[str] = None,    # 仅供 train.py 使用
     ):
         super().__init__()
-        
+
         # 保存所有参数到 hparams（Lightning 会自动处理）
         self.save_hyperparameters(logger=False)
 
@@ -56,7 +64,7 @@ class RTFDataModule(LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         """
         设置数据集（在 Trainer 调用 fit/validate/test 之前执行）。
-        
+
         注意：
         - train.py 已经完成了 shard_assignment 的计算和注入
         - 这里直接使用 self.hparams.shard_assignment
@@ -71,8 +79,10 @@ class RTFDataModule(LightningDataModule):
                 latent_key=self.hparams.latent_key,  # 关键：传递模式信息
                 direction=self.hparams.direction,
                 shard_assignment=self.hparams.shard_assignment,
+                stage_info_path=self.hparams.stage_info_path,
+                use_log_time=self.hparams.use_log_time,
             )
-            
+
             # 验证集
             self.data_val = SomaRTFDataset(
                 root_dir=self.hparams.data_dir,
@@ -82,6 +92,8 @@ class RTFDataModule(LightningDataModule):
                 latent_key=self.hparams.latent_key,
                 direction=self.hparams.direction,
                 shard_assignment=self.hparams.shard_assignment,
+                stage_info_path=self.hparams.stage_info_path,
+                use_log_time=self.hparams.use_log_time,
             )
 
     def train_dataloader(self):

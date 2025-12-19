@@ -2,11 +2,25 @@
 
 _target_: src.data.rtf_datamodule.RTFDataModule
 
-# 数据路径（根据 model.mode 自动调整）
-data_dir: /fast/data/scTFM/rtf/TEDD/tile_4000_fix
+# ===================================================================
+# [核心配置] 数据路径
+# ===================================================================
+
+# 原始数据目录（TileDB-SOMA 格式，包含完整基因表达）
+# 这是必须配置的基础路径
+raw_data_dir: /fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+# 实际使用的数据目录（由 train.py 根据 mode 自动设置）
+# - mode=raw: data_dir = raw_data_dir
+# - mode=latent: data_dir = raw_data_dir + "_latents" (自动推理)
+# 注意：用户通常不需要手动设置此项
+data_dir: ${data.raw_data_dir}
+
+# [可选] 指定 latent 数据目录（不设置则自动推理为 raw_data_dir + "_latents"）
+latent_dir: null
 
 # 批次大小（根据 model.mode 自动调整）
-batch_size: 256
+batch_size: 512
 
 # DataLoader 参数
 num_workers: 8
@@ -34,4 +48,16 @@ direction: forward
 
 # 智能负载均衡方案（由 train.py 自动注入）
 shard_assignment: null
+
+# ===================================================================
+# [时间编码配置]
+# ===================================================================
+
+# Stage 信息 CSV 路径（包含 ID -> Stage 的映射）
+stage_info_path: /gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/tedd_info.csv
+
+# 是否使用 log-scale 时间归一化
+# - true: 使用 log(1 + t) / log(1 + max_t)，压缩大范围同时保留早期分辨率
+# - false: 使用线性归一化 t / max_t
+use_log_time: true
 

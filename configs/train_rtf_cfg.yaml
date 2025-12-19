@@ -1,0 +1,79 @@
+# RTF with Cross-Attention Conditioning and CFG Support
+#
+# 使用方式：
+#   python src/train.py -cn train_rtf_cfg
+#
+# 时间编码说明：
+# - time_curr: [0, 1] 范围（log-scale 归一化后的绝对时间）
+# - delta_t: [-1, 1] 范围（对称 log-scale 归一化的时间差）
+# - stage: 发育阶段，使用顺序编码 + sinusoidal embedding
+
+# @package _global_
+
+defaults:
+  - data: rtf_tedd
+  - model: flow_stage2_cfg
+  - callbacks: default
+  - logger: wandb
+  - trainer: default
+  - paths: default
+  - extra: default
+  - hydra: default
+  - _self_
+
+project: "scTFM-RTF-cross-attn-cfg"
+task_name: "rtf_train_cfg"
+tags: ["rtf", "flow", "cross_attn", "cfg", "time_normalized"]
+seed: 42
+train: true
+
+# Model 配置
+model:
+  ae_ckpt_path: logs/ae_stage1/runs/2025-12-17_06-48-59/checkpoints/epoch_003-val_loss_0.0873.ckpt
+
+# Data 配置
+data:
+  raw_data_dir: /fast/data/scTFM/rtf/TEDD/tile_4000_fix.uniformUnitStart
+  stage_info_path: /gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/tedd_info.csv
+  use_log_time: true
+
+# WandB 配置
+logger:
+  wandb:
+    project: "${project}"
+    name: "${task_name}_${model.mode}"
+    tags: ${tags}
+
+# Trainer 配置
+trainer:
+  max_epochs: 20
+  accelerator: gpu
+  devices: [4,5,6,7]
+  strategy: ddp
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+
+# Callbacks 配置
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_last: true
+    save_top_k: 3
+    auto_insert_metric_name: false
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "val/loss"
+    patience: 15
+    mode: "min"
+
+  model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 1
+
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar

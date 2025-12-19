@@ -3,15 +3,15 @@
 # @package _global_
 
 defaults:
-  - _self_
   - data: rtf_tedd  # RTF 数据集
   - model: flow_stage2  # Flow 模型
   - callbacks: default
   - logger: wandb
   - trainer: default
   - paths: default
-  - extras: default
+  - extra: default
   - hydra: default
+  - _self_  # 放在最后，确保本文件的配置覆盖默认值
 
 # Task 名称
 task_name: "rtf_train"
@@ -21,6 +21,9 @@ tags: ["rtf", "flow", "cell_trajectory"]
 
 # Seed
 seed: 42
+
+# 启用训练
+train: true
 
 # WandB 配置
 logger:
@@ -38,30 +41,81 @@ trainer:
   precision: 16-mixed
   gradient_clip_val: 1.0
 
+# Callbacks 配置（使用 val/loss 监控）
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_last: true
+    save_top_k: 3
+    auto_insert_metric_name: false
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "val/loss"
+    patience: 10
+    mode: "min"
+
+  model_summary:
+    _target_: pytorch_lightning.callbacks.RichModelSummary
+    max_depth: 1
+
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+
 # ===================================================================
 # 快速启动指南
 # ===================================================================
 
-# 1. Latent Mode (默认，推荐)
-# python src/train.py -cn train_rtf model.mode=latent
+# [新功能] Latent 模式自动推理
+# ---------------------------------------------------------------
+# 现在系统会根据 model.mode 自动处理数据目录：
+# - mode=latent: 自动检查/提取 latent 数据
+# - mode=raw: 直接使用原始数据
+#
+# 只需配置：
+#   data.raw_data_dir: 原始数据路径
+#   model.ae_ckpt_path: AE 模型路径（latent 模式需要）
 
-# 2. Raw Mode
-# python src/train.py -cn train_rtf model.mode=raw
-
-# 3. 切换 Flow 类型
-# python src/train.py -cn train_rtf model.flow_type=flow_matching
-
-# 4. 切换方向（时间正向/逆向）
-# python src/train.py -cn train_rtf data.direction=backward
-
-# 5. 组合使用
+# 示例 1: Latent Mode（自动提取 latent）
 # python src/train.py -cn train_rtf \
 #   model.mode=latent \
+#   model.ae_ckpt_path=logs/ae_stage1/checkpoints/best.ckpt \
+#   data.raw_data_dir=/fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+# 示例 2: Latent Mode（已有 latent 数据，跳过提取）
+# python src/train.py -cn train_rtf \
+#   model.mode=latent \
+#   data.raw_data_dir=/fast/data/scTFM/rtf/TEDD/tile_4000_fix
+# (系统会自动查找 tile_4000_fix_latents 目录)
+
+# 示例 3: Raw Mode（直接在基因空间训练）
+# python src/train.py -cn train_rtf \
+#   model.mode=raw \
+#   data.raw_data_dir=/fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+# ===================================================================
+# 更多选项
+# ===================================================================
+
+# 切换 Flow 类型
+# python src/train.py -cn train_rtf model.flow_type=flow_matching
+
+# 切换方向（时间正向/逆向）
+# python src/train.py -cn train_rtf data.direction=backward
+
+# 组合使用
+# python src/train.py -cn train_rtf \
+#   model.mode=latent \
+#   model.ae_ckpt_path=logs/ae_stage1/checkpoints/best.ckpt \
 #   model.flow_type=velocity_flow \
 #   data.direction=both \
 #   data.batch_size=256
 
-# 6. 多卡训练
+# 多卡训练
 # python src/train.py -cn train_rtf \
 #   trainer.devices=[0,1,2,3] \
 #   data.num_workers=8 \

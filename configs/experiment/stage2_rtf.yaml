@@ -1,0 +1,101 @@
+# @package _global_
+#
+# Stage 2: Rectified Flow Training with Cross-Attention and CFG
+#
+# 
+#   python src/train.py experiment=stage2_rtf \
+#     model.ae_ckpt_path=logs/ae_stage1/runs/2025-12-17_06-48-59/checkpoints/epoch_003-val_loss_0.0873.ckpt \
+#     data.raw_data_dir=/fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+defaults:
+  - override /data: rtf_tedd
+  - override /model: flow_stage2_cfg
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "rtf_stage2_cfg"
+
+tags: ["rtf", "flow", "cross_attn", "cfg", "stage2"]
+
+seed: 42
+
+# =============================================================================
+# Trainer Mn
+# =============================================================================
+trainer:
+  min_epochs: 10
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU Mn
+  accelerator: gpu
+  devices: [0,1,2,3,4,5,6,7]
+  strategy: ddp
+
+# =============================================================================
+# Model Mn
+# =============================================================================
+model:
+  mode: latent
+  flow_type: rectified_flow
+
+  ae_ckpt_path: null  
+
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    _partial_: true
+    T_max: 200
+    eta_min: 1e-6
+
+
+  net:
+    hidden_size: 768      
+    depth: 16             
+    num_heads: 12         
+    mlp_ratio: 4.0
+    dropout: 0.0
+    cond_dropout: 0.15    
+
+
+# =============================================================================
+# Data Mn
+# =============================================================================
+data:
+  batch_size: 256
+  num_workers: 8
+
+# =============================================================================
+# Callbacks Mn
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+    auto_insert_metric_name: false
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "val/loss"
+    patience: 30
+    mode: "min"
+
+# =============================================================================
+# Logger Mn
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-RTF"
+    name: "${task_name}_d${model.net.depth}_h${model.net.hidden_size}"
+    tags: ${tags}
+    group: "stage2_rtf"

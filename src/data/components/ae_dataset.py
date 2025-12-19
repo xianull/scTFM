@@ -46,17 +46,17 @@ class SomaCollectionDataset(IterableDataset):
     def n_vars(self):
         """延迟加载特征维度（只在第一次真正需要时才读取元数据）"""
         if self._n_vars is None:
-        tmp_ctx = tiledbsoma.SOMATileDBContext()
-        try:
-            with tiledbsoma.Experiment.open(self.sub_uris[0], context=tmp_ctx) as exp:
+            tmp_ctx = tiledbsoma.SOMATileDBContext()
+            try:
+                with tiledbsoma.Experiment.open(self.sub_uris[0], context=tmp_ctx) as exp:
                     self._n_vars = exp.ms[self.measurement_name].var.count
-        except Exception:
-            if len(self.sub_uris) > 1:
-                with tiledbsoma.Experiment.open(self.sub_uris[1], context=tmp_ctx) as exp:
+            except Exception:
+                if len(self.sub_uris) > 1:
+                    with tiledbsoma.Experiment.open(self.sub_uris[1], context=tmp_ctx) as exp:
                         self._n_vars = exp.ms[self.measurement_name].var.count
-            else:
-                raise
-        
+                else:
+                    raise
+
         return self._n_vars
 
     def _get_context(self):

@@ -27,11 +27,14 @@ class FlowLitModule(LightningModule):
     
     def __init__(
         self,
-        net: nn.Module, 
+        net: nn.Module,
         flow_type: str = "rectified_flow",
         optimizer: torch.optim.Optimizer = None,
         scheduler: torch.optim.lr_scheduler = None,
         compile: bool = False,
+        # 以下参数由 train.py 使用，Module 不需要
+        mode: Optional[str] = None,           # 仅供 train.py 推理数据模式
+        ae_ckpt_path: Optional[str] = None,   # 仅供 train.py 自动提取 latent
     ):
         super().__init__()
         

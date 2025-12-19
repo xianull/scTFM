@@ -28,6 +28,117 @@ from src.utils.dataset_stats_utils import get_dataset_stats
 log = get_pylogger(__name__)
 
 
+def infer_latent_dim_from_ae(cfg: DictConfig) -> None:
+    """
+    从 AE checkpoint 推断 latent_dim 并设置 input_dim。
+
+    此函数在所有进程中执行（包括 DDP 子进程），
+    以确保模型参数形状一致。
+    """
+    if not cfg.get("train"):
+        return
+
+    mode = cfg.model.get("mode")
+    if mode != "latent":
+        return
+
+    ae_ckpt_path = cfg.model.get("ae_ckpt_path")
+    if not ae_ckpt_path:
+        return
+
+    try:
+        from pathlib import Path
+        import yaml
+
+        ckpt_dir = Path(ae_ckpt_path).parent.parent
+        hydra_config_path = ckpt_dir / ".hydra" / "config.yaml"
+
+        if hydra_config_path.exists():
+            with open(hydra_config_path, 'r') as f:
+                ae_cfg = yaml.safe_load(f)
+
+            latent_dim = ae_cfg.get('model', {}).get('net', {}).get('latent_dim')
+            if latent_dim:
+                OmegaConf.set_struct(cfg, False)
+                cfg.model.net.input_dim = latent_dim
+                OmegaConf.set_struct(cfg, True)
+                log.info(f"🔧 自动设置 input_dim={latent_dim} (从 AE checkpoint 读取)")
+    except Exception as e:
+        log.warning(f"⚠️ 无法从 AE checkpoint 推断 latent_dim: {e}")
+
+
+def ensure_latent_data_if_needed(cfg: DictConfig, do_extract: bool = True) -> None:
+    """
+    根据 model.mode 自动处理 latent 数据（仅适用于 RTF 训练）。
+
+    此函数只在以下条件同时满足时执行：
+    1. cfg.train = True（训练模式）
+    2. cfg.model.mode 存在（RTF 模型特有配置，AE 模型没有此字段）
+
+    逻辑：
+    - mode=raw: 直接使用 raw_data_dir
+    - mode=latent: 检查 latent 数据是否存在，不存在则自动提取
+
+    Args:
+        cfg: Hydra 配置对象
+        do_extract: 是否执行实际提取（DDP 子进程设为 False，只做路径推理）
+    """
+    # 只在训练时处理
+    if not cfg.get("train"):
+        return
+
+    # 检查是否是 RTF 训练（AE 模型没有 mode 配置，会直接返回）
+    mode = cfg.model.get("mode")
+    if mode is None:
+        # AE 训练或其他没有 mode 的模型，跳过
+        return
+
+    # 获取 raw_data_dir
+    raw_data_dir = cfg.data.get("raw_data_dir")
+    if raw_data_dir is None:
+        # 向后兼容：如果没有 raw_data_dir，使用 data_dir
+        raw_data_dir = cfg.data.get("data_dir")
+        if raw_data_dir is None:
+            return
+
+    from src.utils.latent_manager import ensure_latent_data, get_latent_dir
+
+    # 获取配置
+    ae_ckpt_path = cfg.model.get("ae_ckpt_path")
+    latent_dir = cfg.data.get("latent_dir")
+
+    try:
+        if do_extract:
+            # 主进程：完整流程（检查 + 必要时提取）
+            actual_data_dir = ensure_latent_data(
+                mode=mode,
+                raw_data_dir=raw_data_dir,
+                ae_ckpt_path=ae_ckpt_path,
+                latent_dir=latent_dir,
+                batch_size=2048,  # 提取时使用较大 batch
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+        else:
+            # DDP 子进程：仅推理路径，不执行提取
+            if mode == "raw":
+                actual_data_dir = raw_data_dir
+            elif mode == "latent":
+                actual_data_dir = latent_dir if latent_dir else get_latent_dir(raw_data_dir)
+            else:
+                actual_data_dir = raw_data_dir
+
+        # 更新配置中的 data_dir
+        OmegaConf.set_struct(cfg, False)
+        cfg.data.data_dir = actual_data_dir
+        OmegaConf.set_struct(cfg, True)
+
+        log.info(f"📁 数据目录已设置: {actual_data_dir}")
+
+    except Exception as e:
+        log.error(f"❌ Latent 数据处理失败: {e}")
+        raise
+
+
 def log_hyperparameters_to_wandb(
     cfg: DictConfig,
     loggers: List[Logger],
@@ -63,26 +174,33 @@ def log_hyperparameters_to_wandb(
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def main(cfg: DictConfig):
     # ---------------------------------------------------------------------------
+    # [关键] 自动推断 latent_dim（所有进程都执行，确保模型参数一致）
+    # ---------------------------------------------------------------------------
+    infer_latent_dim_from_ae(cfg)
+
+    # ---------------------------------------------------------------------------
+    # [新增] 自动处理 Latent 数据
+    # - 主进程（DDP spawn 前）：检查并提取 latent 数据
+    # - DDP 子进程：仅更新 data_dir，不执行实际提取
+    # ---------------------------------------------------------------------------
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    rank = int(os.environ.get("RANK", -1))
+    is_pre_ddp = (local_rank == -1 and rank == -1)
+
+    if cfg.get("train"):
+        # 所有进程都需要更新 data_dir（DDP 子进程只做路径推理，不执行提取）
+        ensure_latent_data_if_needed(cfg, do_extract=is_pre_ddp)
+
+    # ---------------------------------------------------------------------------
     # [关键] 使用文件缓存避免 DDP 多进程重复计算
     # 主进程（spawn 前）计算并保存，子进程（spawn 后）直接读取
     # ---------------------------------------------------------------------------
-    
+
     if cfg.get("train"):
-        import json
-        import tempfile
-        from pathlib import Path
-        
-        # 获取当前进程的 Rank
-        local_rank = int(os.environ.get("LOCAL_RANK", -1))
-        rank = int(os.environ.get("RANK", -1))
-        
-        # 判断是否是主进程（spawn 前：两个都是 -1；spawn 后：会有具体值）
-        is_pre_ddp = (local_rank == -1 and rank == -1)
-        
         try:
             data_dir = cfg.data.get("data_dir")
             batch_size = cfg.data.get("batch_size", 256)
-            
+
             # 计算 World Size
             devices = cfg.trainer.get("devices")
             if devices == "auto":
@@ -98,11 +216,15 @@ def main(cfg: DictConfig):
                     world_size = len(devices.split(","))
                 else:
                     world_size = 1
-            
-            # 使用数据目录的 hash 作为缓存文件名，避免不同数据集冲突
-            cache_key = f"{data_dir}_{batch_size}_{world_size}".replace("/", "_")
-            cache_file = Path(tempfile.gettempdir()) / f"scTFM_stats_{cache_key}.json"
-            
+
+            # 使用 task_name + 数据目录 hash 作为缓存目录，避免不同任务/数据集冲突
+            task_name = cfg.get("task_name", "default")
+            import hashlib
+            data_hash = hashlib.md5(data_dir.encode()).hexdigest()[:8]
+            cache_dir = Path(tempfile.gettempdir()) / "scTFM_cache" / task_name / data_hash
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / f"stats_bs{batch_size}_ws{world_size}.json"
+
             # 获取 DataLoader workers 数（用于负载均衡）
             num_workers_per_gpu = cfg.data.get("num_workers", 16)
             
@@ -172,14 +294,14 @@ def main(cfg: DictConfig):
 
     # 2. DataModule
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
-    
+
     # 如果有缓存的负载均衡方案，注入到 DataModule
     if cfg.get("train"):
         try:
             data_dir = cfg.data.get("data_dir")
             batch_size = cfg.data.get("batch_size", 256)
             devices = cfg.trainer.get("devices")
-            
+
             if devices == "auto":
                 world_size = torch.cuda.device_count()
             elif isinstance(devices, (list, tuple)) or OmegaConf.is_list(devices):
@@ -193,10 +315,14 @@ def main(cfg: DictConfig):
                     world_size = len(devices.split(","))
                 else:
                     world_size = 1
-            
-            cache_key = f"{data_dir}_{batch_size}_{world_size}".replace("/", "_")
-            cache_file = Path(tempfile.gettempdir()) / f"scTFM_stats_{cache_key}.json"
-            
+
+            # 使用与上面一致的 cache 路径
+            task_name = cfg.get("task_name", "default")
+            import hashlib
+            data_hash = hashlib.md5(data_dir.encode()).hexdigest()[:8]
+            cache_dir = Path(tempfile.gettempdir()) / "scTFM_cache" / task_name / data_hash
+            cache_file = cache_dir / f"stats_bs{batch_size}_ws{world_size}.json"
+
             if cache_file.exists():
                 stats = json.loads(cache_file.read_text())
                 if "assignment" in stats:

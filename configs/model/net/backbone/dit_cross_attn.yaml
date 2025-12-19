@@ -1,0 +1,31 @@
+# DiT with Cross-Attention Conditioning
+#
+# 核心改进：
+# 1. x_curr 通过 Cross-Attention 注入（强条件）
+# 2. 支持 Classifier-Free Guidance (CFG)
+# 3. 训练时随机 drop x_curr 条件 (cond_dropout)
+# 4. 时间编码已归一化：time_curr [0,1], delta_t [-1,1]
+# 5. Stage 使用顺序编码 + sinusoidal embedding
+#
+# 适用场景：细胞轨迹预测，x_curr 是核心条件
+
+_target_: src.models.components.backbone.dit_cross_attn.DiTCrossAttn
+
+input_dim: 64  # 会从 AE checkpoint 自动推断
+hidden_size: 1024
+depth: 24
+num_heads: 16
+
+# 条件 Embedding 维度
+n_tissues: 12
+n_celltypes: 62
+n_stages: 6  # 发育阶段：Unknown, Embryonic, Fetal, Newborn, Paediatric, Adult
+
+# CFG dropout
+cond_dropout: 0.15
+
+# MLP 扩展比例
+mlp_ratio: 4.0
+
+# Dropout
+dropout: 0.0
