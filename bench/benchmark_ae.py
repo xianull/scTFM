@@ -25,6 +25,7 @@ os.environ["PROJECT_ROOT"] = project_root
 
 from src.models.ae_module import AELitModule
 from src.data.components.ae_dataset import SomaCollectionDataset
+from src.data.components.scvi_dataset import SomaSCVIDataset
 
 # 设置绘图风格
 sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
@@ -69,87 +70,92 @@ def get_best_checkpoint(run_dir):
     ckpts.sort(key=os.path.getmtime)
     return ckpts[-1]
 
-def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096, num_workers=4, prefetch_factor=2):
+def setup_dataloaders(data_dir, batch_size=1024, io_chunk_size=4096, num_workers=4, prefetch_factor=2, model_type="ae"):
     """
-    使用 SomaCollectionDataset 构建 DataLoader（使用最新优化方案）。
-    
+    使用 SomaCollectionDataset 或 SomaSCVIDataset 构建 DataLoader。
+
     Split Labels:
     0: Train (ID)
     1: Val (ID)
     2: Test (ID)
     3: Test (OOD)
+
+    Args:
+        model_type: "ae" 使用 SomaCollectionDataset, "scvi_ae" 使用 SomaSCVIDataset
     """
-    logger.info(f"Setting up dataloaders from {data_dir}...")
-    
+    logger.info(f"Setting up dataloaders from {data_dir} (model_type={model_type})...")
+
     # [优化] 预扫描 shards，避免多个 workers 重复扫描
     logger.info(f"🔍 Pre-scanning shards...")
     preloaded_sub_uris = sorted([
-        os.path.join(data_dir, d) 
-        for d in os.listdir(data_dir) 
+        os.path.join(data_dir, d)
+        for d in os.listdir(data_dir)
         if os.path.isdir(os.path.join(data_dir, d))
     ])
     logger.info(f"✅ Found {len(preloaded_sub_uris)} shards (will be shared across all workers)")
-    
+
+    # 选择 Dataset 类
+    if model_type == "scvi_ae":
+        DatasetClass = SomaSCVIDataset
+    else:
+        DatasetClass = SomaCollectionDataset
+
     # Test ID (Split 2)
-    # 如果没有 Test set，SomaCollectionDataset 会处理为空的情况，但我们需要 catch
     try:
-        ds_test_id = SomaCollectionDataset(
-            root_dir=data_dir, 
+        ds_test_id = DatasetClass(
+            root_dir=data_dir,
             split_label=2, # Test ID
             batch_size=batch_size,
             io_chunk_size=io_chunk_size,
-            preloaded_sub_uris=preloaded_sub_uris  # 传入预扫描结果
+            preloaded_sub_uris=preloaded_sub_uris
         )
-        # 检查是否为空 (通过尝试获取一个 iterator，或者直接相信 dataset 内部逻辑)
-        # SomaCollectionDataset 是 IterableDataset，len() 不可用
         loader_test_id = DataLoader(
-            ds_test_id, 
+            ds_test_id,
             batch_size=None, # Dataset handles batching
-            num_workers=num_workers, 
-            persistent_workers=True, 
+            num_workers=num_workers,
+            persistent_workers=True,
             pin_memory=True,
-            prefetch_factor=prefetch_factor  # 优化预加载
+            prefetch_factor=prefetch_factor
         )
     except Exception as e:
         logger.warning(f"Failed to load Test ID (Split 2): {e}. Falling back to Validation (Split 1).")
-        ds_test_id = SomaCollectionDataset(
-            root_dir=data_dir, 
+        ds_test_id = DatasetClass(
+            root_dir=data_dir,
             split_label=1, # Fallback to Val
             batch_size=batch_size,
             io_chunk_size=io_chunk_size,
             preloaded_sub_uris=preloaded_sub_uris
         )
         loader_test_id = DataLoader(
-            ds_test_id, 
-            batch_size=None, 
-            num_workers=num_workers, 
-            persistent_workers=True, 
+            ds_test_id,
+            batch_size=None,
+            num_workers=num_workers,
+            persistent_workers=True,
             pin_memory=True,
             prefetch_factor=prefetch_factor
         )
-    
+
     # Test OOD (Split 3)
     loader_ood = None
     try:
-        # 先简单检查一下是否有 OOD 数据 (非强制)
-        ds_ood = SomaCollectionDataset(
-            root_dir=data_dir, 
+        ds_ood = DatasetClass(
+            root_dir=data_dir,
             split_label=3, # Test OOD
             batch_size=batch_size,
             io_chunk_size=io_chunk_size,
             preloaded_sub_uris=preloaded_sub_uris
         )
         loader_ood = DataLoader(
-            ds_ood, 
-            batch_size=None, 
-            num_workers=num_workers, 
-            persistent_workers=True, 
+            ds_ood,
+            batch_size=None,
+            num_workers=num_workers,
+            persistent_workers=True,
             pin_memory=True,
             prefetch_factor=prefetch_factor
         )
     except Exception:
         logger.info("No OOD data found or load failed (Split 3). Skipping OOD evaluation.")
-        
+
     return loader_test_id, loader_ood
 
 def evaluate_model(model, dataloader, device, desc="ID"):
@@ -298,6 +304,167 @@ def evaluate_model(model, dataloader, device, desc="ID"):
         }
     }
 
+
+def evaluate_scvi_model(model, dataloader, device, desc="ID"):
+    """
+    在给定 DataLoader 上评估 scVI-style 模型。
+
+    scVI 模型特点:
+    - 输入: dict with 'x' (log1p normalized), 'counts', 'library_size'
+    - 输出: (mu, z, outputs) where mu = library_size * rho
+    - 重建目标: normalized counts (not log1p)
+
+    评估时使用 log1p(mu) 与 x 进行比较（保持在相同尺度）
+    """
+    model.eval()
+    mse_sum = 0
+    n_elements = 0
+    n_total_cells = 0
+
+    cell_corr_sum = 0.0
+
+    sum_orig = None
+    sum_recon = None
+    sum_sq_orig = None
+    sum_sq_recon = None
+    sum_gt0_orig = None
+    sum_gt0_recon = None
+
+    latents = []
+
+    n_keep = 4096
+    kept_recon = []
+    kept_orig = []
+
+    # NB loss accumulation
+    nb_loss_sum = 0.0
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"Evaluating {desc}"):
+            # SomaSCVIDataset returns dict: {'x': log1p, 'counts': expm1, 'library_size': ...}
+            x = batch['x'].to(device)
+            counts = batch['counts'].to(device)
+            library_size = batch['library_size'].to(device)
+
+            # Forward pass: model returns (mu, z, outputs)
+            mu, z, outputs = model(x, library_size)
+
+            # mu 是 NB 的均值 (library_size * rho)
+            # 为了与 x (log1p normalized) 比较，需要转换到相同尺度
+            # recon_x = log1p(mu) 是重建的 log1p normalized expression
+            recon_x = torch.log1p(mu)
+
+            # 检查 NaN/Inf
+            if torch.isnan(recon_x).any() or torch.isinf(recon_x).any():
+                logger.warning(f"Found NaN/Inf in reconstruction, skipping batch")
+                continue
+
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                logger.warning(f"Found NaN/Inf in input, skipping batch")
+                continue
+
+            # 1. MSE (在 log1p 空间比较)
+            loss = torch.nn.functional.mse_loss(recon_x, x, reduction='sum')
+            mse_sum += loss.item()
+            n_elements += x.numel()
+            n_total_cells += x.size(0)
+
+            # 2. NB Loss (在 count 空间)
+            from src.models.components.ae.losses import log_nb_positive
+            theta = outputs['theta']
+            nb_ll = log_nb_positive(counts, mu, theta)
+            nb_loss_sum += (-nb_ll.sum().item())
+
+            # 3. Per-Cell Pearson Correlation (在 log1p 空间)
+            vx = x - x.mean(dim=1, keepdim=True)
+            vy = recon_x - recon_x.mean(dim=1, keepdim=True)
+            cost = (vx * vy).sum(dim=1) / (torch.sqrt((vx ** 2).sum(dim=1)) * torch.sqrt((vy ** 2).sum(dim=1)) + 1e-8)
+            cell_corr_sum += cost.sum().item()
+
+            # 4. Global Stats Accumulation
+            if sum_orig is None:
+                sum_orig = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+                sum_recon = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+                sum_sq_orig = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+                sum_sq_recon = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+                sum_gt0_orig = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+                sum_gt0_recon = torch.zeros(x.size(1), device=device, dtype=torch.float64)
+
+            x_64 = x.to(torch.float64)
+            recon_64 = recon_x.to(torch.float64)
+
+            sum_orig += x_64.sum(dim=0)
+            sum_recon += recon_64.sum(dim=0)
+            sum_sq_orig += (x_64 ** 2).sum(dim=0)
+            sum_sq_recon += (recon_64 ** 2).sum(dim=0)
+            sum_gt0_orig += (x_64 > 0).float().sum(dim=0)
+            sum_gt0_recon += (recon_64 > 0).float().sum(dim=0)
+
+            latents.append(z.cpu().numpy())
+
+            current_kept = sum(arr.shape[0] for arr in kept_recon)
+            if current_kept < n_keep:
+                kept_recon.append(recon_x.cpu().numpy())
+                kept_orig.append(x.cpu().numpy())
+
+    if n_total_cells == 0:
+        logger.warning(f"No data found for {desc}")
+        return None
+
+    mse = mse_sum / n_elements if n_elements > 0 else float('nan')
+    nb_loss = nb_loss_sum / n_total_cells if n_total_cells > 0 else float('nan')
+    mean_cell_corr = cell_corr_sum / n_total_cells if n_total_cells > 0 else float('nan')
+
+    # Global Gene Statistics
+    mean_orig = (sum_orig / n_total_cells).float()
+    mean_recon = (sum_recon / n_total_cells).float()
+
+    var_orig = ((sum_sq_orig / n_total_cells) - (mean_orig.double() ** 2)).float()
+    var_recon = ((sum_sq_recon / n_total_cells) - (mean_recon.double() ** 2)).float()
+
+    var_orig = torch.clamp(var_orig, min=0.0)
+    var_recon = torch.clamp(var_recon, min=0.0)
+
+    dropout_orig = 1.0 - (sum_gt0_orig / n_total_cells).float()
+    dropout_recon = 1.0 - (sum_gt0_recon / n_total_cells).float()
+
+    vm_orig = mean_orig - mean_orig.mean()
+    vm_recon = mean_recon - mean_recon.mean()
+    norm_orig = torch.sqrt((vm_orig**2).sum())
+    norm_recon = torch.sqrt((vm_recon**2).sum())
+    if norm_orig > 1e-8 and norm_recon > 1e-8:
+        gene_mean_corr = ((vm_orig * vm_recon).sum() / (norm_orig * norm_recon)).item()
+    else:
+        gene_mean_corr = float('nan')
+
+    latents = np.concatenate(latents, axis=0)
+
+    if kept_recon:
+        kept_recon = np.concatenate(kept_recon, axis=0)
+        kept_orig = np.concatenate(kept_orig, axis=0)
+        if kept_recon.shape[0] > n_keep:
+            kept_recon = kept_recon[:n_keep]
+            kept_orig = kept_orig[:n_keep]
+
+    return {
+        "mse": mse,
+        "nb_loss": nb_loss,
+        "mean_cell_corr": mean_cell_corr,
+        "gene_mean_corr": gene_mean_corr,
+        "latents": latents,
+        "recon_sample": kept_recon,
+        "orig_sample": kept_orig,
+        "stats": {
+            "mean_orig": mean_orig.cpu().numpy(),
+            "mean_recon": mean_recon.cpu().numpy(),
+            "var_orig": var_orig.cpu().numpy(),
+            "var_recon": var_recon.cpu().numpy(),
+            "dropout_orig": dropout_orig.cpu().numpy(),
+            "dropout_recon": dropout_recon.cpu().numpy()
+        }
+    }
+
+
 def plot_reconstruction(orig, recon, title_suffix="", save_path=None):
     mean_orig = np.mean(orig, axis=0)
     mean_recon = np.mean(recon, axis=0)
@@ -393,14 +560,24 @@ def plot_gene_corr_scatter(orig_data, recon_data, title_suffix="", save_path=Non
         plt.savefig(save_path)
         plt.close()
 
-def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
+def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1, model_type="ae"):
+    """
+    运行单个模型的 benchmark。
+
+    Args:
+        run_dir: 包含 .hydra/config.yaml 的运行目录
+        wandb_base_cfg: WandB 配置文件路径
+        run_idx: 当前运行索引
+        total_runs: 总运行数
+        model_type: 模型类型 ("ae" 或 "scvi_ae")
+    """
     logger.info(f"{'='*80}")
-    logger.info(f"📊 Processing run [{run_idx}/{total_runs}]: {run_dir}")
+    logger.info(f"📊 Processing run [{run_idx}/{total_runs}]: {run_dir} (model_type={model_type})")
     logger.info(f"{'='*80}")
-    
+
     cfg_path = os.path.join(run_dir, ".hydra", "config.yaml")
     cfg = OmegaConf.load(cfg_path)
-    
+
     if "paths" in cfg:
         project_root = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
         cfg.paths.root_dir = project_root
@@ -408,23 +585,40 @@ def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
         cfg.paths.log_dir = os.path.join(project_root, "logs")
         cfg.paths.output_dir = run_dir
         cfg.paths.work_dir = run_dir
-            
+
     ckpt_path = get_best_checkpoint(run_dir)
     if not ckpt_path:
         logger.warning(f"❌ No checkpoint found in {run_dir}, skipping.")
         return
-    
+
     logger.info(f"✅ Found checkpoint: {ckpt_path}")
-    
+
     logger.info(f"⚙️  Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net_cfg = cfg.model.net
     net = instantiate(net_cfg)
-    model = AELitModule.load_from_checkpoint(ckpt_path, net=net, optimizer=None, scheduler=None, map_location=device)
+
+    # scvi_ae 使用的是 net 而不是 AELitModule
+    if model_type == "scvi_ae":
+        # 直接加载网络权重
+        ckpt = torch.load(ckpt_path, map_location=device)
+        state_dict = ckpt.get("state_dict", ckpt)
+        # 移除 "net." 前缀 (如果存在)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("net."):
+                new_state_dict[k[4:]] = v
+            else:
+                new_state_dict[k] = v
+        net.load_state_dict(new_state_dict, strict=False)
+        model = net
+    else:
+        model = AELitModule.load_from_checkpoint(ckpt_path, net=net, optimizer=None, scheduler=None, map_location=device)
+
     model.to(device)
     model.eval()
     logger.info(f"✅ Model loaded on {device}")
-    
+
     # 4. 准备数据
     logger.info(f"📦 Preparing dataloaders...")
     # 从 cfg.data.data_dir 获取路径，或者使用默认的
@@ -433,13 +627,14 @@ def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
     io_chunk_size = cfg.data.get("io_chunk_size", 4096)
     num_workers = cfg.data.get("num_workers", 4)
     prefetch_factor = cfg.data.get("prefetch_factor", 2)
-    
+
     loader_id, loader_ood = setup_dataloaders(
-        data_dir, 
-        batch_size=batch_size, 
+        data_dir,
+        batch_size=batch_size,
         io_chunk_size=io_chunk_size,
         num_workers=num_workers,
-        prefetch_factor=prefetch_factor
+        prefetch_factor=prefetch_factor,
+        model_type=model_type
     )
     
     # 5. WandB Init
@@ -462,37 +657,58 @@ def run_benchmark(run_dir, wandb_base_cfg, run_idx=1, total_runs=1):
         name=run_name,
         config=config_dict,
         job_type="benchmark",
-        tags=["benchmark"],
+        tags=["benchmark", model_type],
         reinit=True
     )
     logger.info(f"✅ W&B run: {run.name}")
-    
+
+    # 选择评估函数
+    if model_type == "scvi_ae":
+        eval_fn = evaluate_scvi_model
+    else:
+        eval_fn = evaluate_model
+
     # 6. Eval ID
     logger.info(f"🧪 Evaluating on ID Test set...")
-    res_id = evaluate_model(model, loader_id, device, desc="ID Test")
+    res_id = eval_fn(model, loader_id, device, desc="ID Test")
     if res_id:
-        wandb.log({
+        log_dict = {
             "eval/id_mse": res_id['mse'],
             "eval/id_cell_corr": res_id['mean_cell_corr'],
             "eval/id_gene_corr": res_id['gene_mean_corr']
-        })
-        logger.info(f"✅ ID Results - MSE: {res_id['mse']:.6f}, Cell Corr: {res_id['mean_cell_corr']:.4f}, Gene Mean Corr: {res_id['gene_mean_corr']:.4f}")
+        }
+        # scvi_ae 额外记录 NB loss
+        if 'nb_loss' in res_id:
+            log_dict["eval/id_nb_loss"] = res_id['nb_loss']
+        wandb.log(log_dict)
+
+        log_msg = f"✅ ID Results - MSE: {res_id['mse']:.6f}, Cell Corr: {res_id['mean_cell_corr']:.4f}, Gene Mean Corr: {res_id['gene_mean_corr']:.4f}"
+        if 'nb_loss' in res_id:
+            log_msg += f", NB Loss: {res_id['nb_loss']:.4f}"
+        logger.info(log_msg)
         logger.info(f"📊 Generating ID plots...")
         generate_plots(res_id, "id")
         logger.info(f"✅ ID plots generated")
-    
+
     # 7. Eval OOD
-    # 修复：IterableDataset 没有 __len__，使用 is not None 判断
+    res_ood = None
     if loader_ood is not None:
         logger.info(f"🧪 Evaluating on OOD Test set...")
-        res_ood = evaluate_model(model, loader_ood, device, desc="OOD Test")
+        res_ood = eval_fn(model, loader_ood, device, desc="OOD Test")
         if res_ood:
-            wandb.log({
+            log_dict = {
                 "eval/ood_mse": res_ood['mse'],
                 "eval/ood_cell_corr": res_ood['mean_cell_corr'],
                 "eval/ood_gene_corr": res_ood['gene_mean_corr']
-            })
-            logger.info(f"✅ OOD Results - MSE: {res_ood['mse']:.6f}, Cell Corr: {res_ood['mean_cell_corr']:.4f}, Gene Mean Corr: {res_ood['gene_mean_corr']:.4f}")
+            }
+            if 'nb_loss' in res_ood:
+                log_dict["eval/ood_nb_loss"] = res_ood['nb_loss']
+            wandb.log(log_dict)
+
+            log_msg = f"✅ OOD Results - MSE: {res_ood['mse']:.6f}, Cell Corr: {res_ood['mean_cell_corr']:.4f}, Gene Mean Corr: {res_ood['gene_mean_corr']:.4f}"
+            if 'nb_loss' in res_ood:
+                log_msg += f", NB Loss: {res_ood['nb_loss']:.4f}"
+            logger.info(log_msg)
             logger.info(f"📊 Generating OOD plots...")
             generate_plots(res_ood, "ood")
             logger.info(f"✅ OOD plots generated")
@@ -581,25 +797,27 @@ def main():
     parser = argparse.ArgumentParser(description="AE 模型批量测评脚本")
     parser.add_argument("--dir", type=str, required=True, help="包含运行日志的目录")
     parser.add_argument("--wandb_config", type=str, default="configs/logger/wandb.yaml", help="WandB 配置文件路径")
-    
+    parser.add_argument("--model_type", type=str, default="ae", choices=["ae", "scvi_ae"],
+                        help="模型类型: 'ae' (普通 AE) 或 'scvi_ae' (scVI-style AE)")
+
     args = parser.parse_args()
-    
+
     if not os.path.exists(args.dir):
         logger.error(f"❌ Directory not found: {args.dir}")
         sys.exit(1)
-        
+
     runs = find_runs(args.dir)
-    logger.info(f"🚀 Found {len(runs)} runs to benchmark.")
+    logger.info(f"🚀 Found {len(runs)} runs to benchmark (model_type={args.model_type}).")
     logger.info(f"{'='*80}\n")
-    
+
     for idx, run in enumerate(runs, start=1):
         try:
-            run_benchmark(run, args.wandb_config, run_idx=idx, total_runs=len(runs))
+            run_benchmark(run, args.wandb_config, run_idx=idx, total_runs=len(runs), model_type=args.model_type)
             logger.info(f"\n")
         except Exception as e:
             logger.error(f"❌ Failed to benchmark run {run}: {e}", exc_info=True)
             logger.info(f"\n")
-    
+
     logger.info(f"{'='*80}")
     logger.info(f"🎉 All benchmarks completed! Total runs: {len(runs)}")
     logger.info(f"{'='*80}")

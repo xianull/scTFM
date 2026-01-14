@@ -1375,7 +1375,7 @@ def run_trajectory_visualization(
     return figures
 
 
-def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=50, max_batches=100, cfg_scale=1.0):
+def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=50, max_batches=100, cfg_scale=1.0, eval_split="ood", skip_trajectory=False):
     """
     对单个运行进行评测。
 
@@ -1387,6 +1387,8 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
         sample_steps: ODE 采样步数
         max_batches: 最大评估批次数
         cfg_scale: Classifier-Free Guidance 强度（1.0 = 不使用 CFG）
+        eval_split: 评估哪个 split ('id', 'ood', 'both')
+        skip_trajectory: 是否跳过时序轨迹可视化
     """
     logger.info(f"{'='*80}")
     logger.info(f"Processing run [{run_idx}/{total_runs}]: {run_dir}")
@@ -1409,40 +1411,9 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     logger.info("Loading model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # [关键] 如果是 latent 模式，需要推断正确的 input_dim
-    # 因为 hydra 配置保存的可能是默认值
+    # 从配置获取 mode
     mode = cfg.model.get("mode", "raw")
-    ae_ckpt_path = cfg.model.get("ae_ckpt_path")
-
-    # 先尝试从 checkpoint 本身推断 input_dim
-    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state_dict = checkpoint.get('state_dict', checkpoint)
-
-    # 从 x_embedder.weight 推断 input_dim
-    x_embedder_key = 'flow.backbone.x_embedder.weight'
-    if x_embedder_key in state_dict:
-        # shape: [hidden_size, input_dim]
-        inferred_input_dim = state_dict[x_embedder_key].shape[1]
-        logger.info(f"Inferred input_dim={inferred_input_dim} from checkpoint")
-        OmegaConf.set_struct(cfg, False)
-        cfg.model.net.input_dim = inferred_input_dim
-        OmegaConf.set_struct(cfg, True)
-    elif mode == "latent" and ae_ckpt_path:
-        # 回退：尝试从 AE checkpoint 的 hydra 配置读取 latent_dim
-        from pathlib import Path
-        ae_ckpt_dir = Path(ae_ckpt_path).parent.parent
-        ae_hydra_config = ae_ckpt_dir / ".hydra" / "config.yaml"
-
-        if ae_hydra_config.exists():
-            ae_cfg = OmegaConf.load(ae_hydra_config)
-            latent_dim = ae_cfg.get('model', {}).get('net', {}).get('latent_dim')
-            if latent_dim:
-                logger.info(f"Inferred input_dim={latent_dim} from AE config")
-                OmegaConf.set_struct(cfg, False)
-                cfg.model.net.input_dim = latent_dim
-                OmegaConf.set_struct(cfg, True)
-
-    del checkpoint  # 释放内存
+    logger.info(f"Model mode: {mode}")
 
     # 实例化 backbone net
     net_cfg = cfg.model.net
@@ -1463,23 +1434,14 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     # 4. 准备数据
     logger.info("Preparing dataloader...")
 
-    # [关键] 根据 mode 确定正确的数据目录
-    raw_data_dir = cfg.data.get("raw_data_dir")
-    if raw_data_dir is None:
-        # 向后兼容：尝试使用 data_dir
-        raw_data_dir = cfg.data.get("data_dir")
-
-    # 根据 mode 决定实际数据目录
-    if mode == "latent" and raw_data_dir:
-        data_dir = raw_data_dir + "_latents"
-        logger.info(f"Latent mode: using latent data from {data_dir}")
-    else:
-        data_dir = raw_data_dir
-        logger.info(f"Raw mode: using raw data from {data_dir}")
+    # 获取数据目录（优先使用 raw_data_dir，向后兼容 data_dir）
+    data_dir = cfg.data.get("raw_data_dir") or cfg.data.get("data_dir")
 
     if not data_dir or not os.path.exists(data_dir):
         logger.error(f"Data directory not found: {data_dir}")
         return
+
+    logger.info(f"Using data from {data_dir}")
 
     batch_size = cfg.data.get("batch_size", 256)
     num_workers = cfg.data.get("num_workers", 4)
@@ -1488,26 +1450,18 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     stage_info_path = cfg.data.get("stage_info_path")
     use_log_time = cfg.data.get("use_log_time", True)
 
-    # 使用 OOD（split_label=3）进行评测，整个 shard 作为 OOD
-    loader = setup_dataloader(
-        data_dir, split_label=3, batch_size=batch_size, num_workers=num_workers,
-        stage_info_path=stage_info_path, use_log_time=use_log_time
-    )
-
     # 5. 初始化 W&B
     logger.info("Initializing W&B...")
-    run_name = f"bench_{os.path.basename(run_dir)}"
+    run_name = f"bench_{os.path.basename(run_dir)}_{eval_split}"
 
-    # 清理配置（移除无法解析的插值和不需要的字段）
+    # 清理配置
     config_dict = {}
     try:
-        # 只提取关键配置，避免插值解析失败
         if 'model' in cfg:
             model_cfg = cfg.model
             config_dict['model'] = {
                 'mode': model_cfg.get('mode'),
                 'flow_type': model_cfg.get('flow_type'),
-                'ae_ckpt_path': model_cfg.get('ae_ckpt_path'),
             }
             if 'net' in model_cfg:
                 config_dict['model']['net'] = {
@@ -1527,45 +1481,73 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
         logger.warning(f"Failed to extract config: {e}")
         config_dict = {'run_dir': run_dir}
 
-    # 添加 CFG 相关配置到 wandb
     config_dict['cfg_scale'] = cfg_scale
+    config_dict['eval_split'] = eval_split
+    config_dict['sample_steps'] = sample_steps
 
     wandb_run = wandb.init(
         project=wandb_project,
         name=run_name,
         config=config_dict,
         job_type="benchmark",
-        tags=["rtf", "benchmark"] + (["cfg"] if cfg_scale != 1.0 else []),
+        tags=["rtf", "benchmark", eval_split] + (["cfg"] if cfg_scale != 1.0 else []),
         reinit=True
     )
     logger.info(f"W&B run: {wandb_run.name}")
 
     # 6. 评估
-    logger.info(f"Evaluating (sample_steps={sample_steps}, max_batches={max_batches}, cfg_scale={cfg_scale})...")
-    results = evaluate_model(model, loader, device, sample_steps=sample_steps, max_batches=max_batches, cfg_scale=cfg_scale)
+    def run_eval(split_label, split_name):
+        """运行单个 split 的评估"""
+        logger.info(f"\n{'='*40}")
+        logger.info(f"Evaluating {split_name} (split_label={split_label})...")
+        logger.info(f"{'='*40}")
+
+        loader = setup_dataloader(
+            data_dir, split_label=split_label, batch_size=batch_size, num_workers=num_workers,
+            stage_info_path=stage_info_path, use_log_time=use_log_time
+        )
+
+        results = evaluate_model(model, loader, device, sample_steps=sample_steps, max_batches=max_batches, desc=split_name, cfg_scale=cfg_scale)
+
+        if results is None:
+            logger.warning(f"No evaluation results for {split_name}")
+            return None
+
+        # 记录指标
+        prefix = f"eval/{split_name}"
+        wandb.log({
+            f"{prefix}/mse": results['mse'],
+            f"{prefix}/mse_std": results['mse_std'],
+            f"{prefix}/corr": results['corr'],
+            f"{prefix}/corr_std": results['corr_std'],
+            f"{prefix}/corr_median": float(np.median(results['all_corrs'])),
+            f"{prefix}/pct_corr_gt_0.5": float(100 * np.mean(results['all_corrs'] > 0.5)),
+            f"{prefix}/pct_corr_gt_0.7": float(100 * np.mean(results['all_corrs'] > 0.7)),
+            f"{prefix}/pct_corr_gt_0.9": float(100 * np.mean(results['all_corrs'] > 0.9)),
+        })
+        logger.info(f"{split_name} Results - MSE: {results['mse']:.6f} +/- {results['mse_std']:.6f}")
+        logger.info(f"{split_name} Results - Corr: {results['corr']:.4f} +/- {results['corr_std']:.4f}")
+        logger.info(f"{split_name} Results - Corr > 0.5: {100 * np.mean(results['all_corrs'] > 0.5):.1f}%")
+
+        return results
+
+    # 根据 eval_split 决定评估哪些 split
+    results_dict = {}
+    if eval_split in ("id", "both"):
+        results_dict['id'] = run_eval(split_label=2, split_name="ID")
+    if eval_split in ("ood", "both"):
+        results_dict['ood'] = run_eval(split_label=3, split_name="OOD")
+
+    # 选择一个结果用于可视化（优先 OOD）
+    results = results_dict.get('ood') or results_dict.get('id')
 
     if results is None:
-        logger.warning("No evaluation results, skipping.")
+        logger.warning("No evaluation results, skipping visualizations.")
         wandb.finish()
         return
 
-    # 记录指标
-    wandb.log({
-        "eval/mse": results['mse'],
-        "eval/mse_std": results['mse_std'],
-        "eval/corr": results['corr'],
-        "eval/corr_std": results['corr_std'],
-        "eval/corr_median": float(np.median(results['all_corrs'])),
-        "eval/pct_corr_gt_0.5": float(100 * np.mean(results['all_corrs'] > 0.5)),
-        "eval/pct_corr_gt_0.7": float(100 * np.mean(results['all_corrs'] > 0.7)),
-        "eval/pct_corr_gt_0.9": float(100 * np.mean(results['all_corrs'] > 0.9)),
-    })
-    logger.info(f"Results - MSE: {results['mse']:.6f} +/- {results['mse_std']:.6f}")
-    logger.info(f"Results - Corr: {results['corr']:.4f} +/- {results['corr_std']:.4f}")
-    logger.info(f"Results - Corr > 0.5: {100 * np.mean(results['all_corrs'] > 0.5):.1f}%")
-
     # 7. 生成可视化
-    logger.info("Generating visualizations...")
+    logger.info("\nGenerating visualizations...")
 
     # 7.1 相关系数分布
     fig_path = "corr_dist.png"
@@ -1629,31 +1611,34 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
     os.remove(fig_path)
 
     # 7.11 时序轨迹可视化（自回归生成）
-    logger.info("Generating temporal trajectory visualizations...")
-    try:
-        trajectory_figs = run_trajectory_visualization(
-            model,
-            data_dir,
-            device,
-            stage_info_path=stage_info_path,
-            use_log_time=use_log_time,
-            sample_steps=sample_steps,
-            max_shards=3,
-            save_dir=None,
-        )
-        for fig_info in trajectory_figs:
-            shard_name = fig_info['shard_name']
-            # 上传 UMAP 图
-            if fig_info['save_path_umap'] and os.path.exists(fig_info['save_path_umap']):
-                wandb.log({f"plots/trajectory_umap_{shard_name}": wandb.Image(fig_info['save_path_umap'])})
-                os.remove(fig_info['save_path_umap'])
-            # 上传 Strip plot 图
-            if fig_info['save_path_strip'] and os.path.exists(fig_info['save_path_strip']):
-                wandb.log({f"plots/trajectory_strip_{shard_name}": wandb.Image(fig_info['save_path_strip'])})
-                os.remove(fig_info['save_path_strip'])
-        logger.info(f"Generated trajectory visualizations for {len(trajectory_figs)} shards")
-    except Exception as e:
-        logger.warning(f"Failed to generate trajectory visualizations: {e}")
+    if not skip_trajectory:
+        logger.info("Generating temporal trajectory visualizations...")
+        try:
+            trajectory_figs = run_trajectory_visualization(
+                model,
+                data_dir,
+                device,
+                stage_info_path=stage_info_path,
+                use_log_time=use_log_time,
+                sample_steps=sample_steps,
+                max_shards=3,
+                save_dir=None,
+            )
+            for fig_info in trajectory_figs:
+                shard_name = fig_info['shard_name']
+                # 上传 UMAP 图
+                if fig_info['save_path_umap'] and os.path.exists(fig_info['save_path_umap']):
+                    wandb.log({f"plots/trajectory_umap_{shard_name}": wandb.Image(fig_info['save_path_umap'])})
+                    os.remove(fig_info['save_path_umap'])
+                # 上传 Strip plot 图
+                if fig_info['save_path_strip'] and os.path.exists(fig_info['save_path_strip']):
+                    wandb.log({f"plots/trajectory_strip_{shard_name}": wandb.Image(fig_info['save_path_strip'])})
+                    os.remove(fig_info['save_path_strip'])
+            logger.info(f"Generated trajectory visualizations for {len(trajectory_figs)} shards")
+        except Exception as e:
+            logger.warning(f"Failed to generate trajectory visualizations: {e}")
+    else:
+        logger.info("Skipping trajectory visualizations (--skip_trajectory)")
 
     logger.info(f"Benchmark complete for run [{run_idx}/{total_runs}]")
     wandb.finish()
@@ -1662,11 +1647,15 @@ def run_benchmark(run_dir, wandb_project, run_idx=1, total_runs=1, sample_steps=
 def main():
     parser = argparse.ArgumentParser(description="RTF 模型批量测评脚本")
     parser.add_argument("--dir", type=str, required=True, help="包含运行日志的目录")
-    parser.add_argument("--wandb_project", type=str, default="rtf-cross-bench-cfg", help="W&B 项目名称")
+    parser.add_argument("--wandb_project", type=str, default="scTFM-RTF-bench", help="W&B 项目名称")
     parser.add_argument("--sample_steps", type=int, default=50, help="ODE 采样步数")
     parser.add_argument("--max_batches", type=int, default=100, help="最大评估批次数")
     parser.add_argument("--cfg_scale", type=float, default=1.0,
                        help="Classifier-Free Guidance 强度 (1.0=不使用, >1.0=增强条件)")
+    parser.add_argument("--split", type=str, default="ood", choices=["id", "ood", "both"],
+                       help="评估哪个 split: 'id' (Test ID), 'ood' (Test OOD), 'both'")
+    parser.add_argument("--skip_trajectory", action="store_true",
+                       help="跳过时序轨迹可视化（节省时间）")
 
     args = parser.parse_args()
 
@@ -1676,6 +1665,7 @@ def main():
 
     runs = find_runs(args.dir)
     logger.info(f"Found {len(runs)} runs to benchmark.")
+    logger.info(f"Evaluation split: {args.split}")
     if args.cfg_scale != 1.0:
         logger.info(f"Using CFG with scale={args.cfg_scale}")
     logger.info(f"{'='*80}\n")
@@ -1689,7 +1679,9 @@ def main():
                 total_runs=len(runs),
                 sample_steps=args.sample_steps,
                 max_batches=args.max_batches,
-                cfg_scale=args.cfg_scale
+                cfg_scale=args.cfg_scale,
+                eval_split=args.split,
+                skip_trajectory=args.skip_trajectory
             )
             logger.info("\n")
         except Exception as e:

@@ -10,7 +10,7 @@ model:
   # ===================================================================
   # [核心参数] 模式选择: latent (推荐) 或 raw
   # ===================================================================
-  mode: latent  # "latent" 或 "raw"
+  mode: raw  # "latent" 或 "raw"
 
   # Flow 模型类型: "rectified_flow" (默认), "flow_matching", "velocity_flow"
   flow_type: rectified_flow

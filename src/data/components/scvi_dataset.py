@@ -1,15 +1,16 @@
 """
-scVI-style Dataset for Single-Cell Data (Optimized - Merged Matrix)
+scVI-style Dataset for Single-Cell Data (Fast Version)
 
-数据格式 (由 preprocess_tiledb_scvi.py 生成):
-- X: [log1p(normalized) | raw_counts], shape (n_cells, 2 * n_genes)
-  - 前 n_genes 列: log1p(normalized) - Encoder 输入
-  - 后 n_genes 列: raw counts - NB Loss 目标
-- obs['library_size']: 每个细胞的 UMI 总数
+使用 normalized counts (expm1) 代替 raw counts:
+- x: log1p(normalized) - Encoder 输入
+- counts: expm1(x) = normalized counts - NB Loss 目标
+- library_size: counts.sum() - Decoder 缩放
 
-优化点:
-- 只读取一个稀疏矩阵，然后在内存中 split
-- 与 ae_dataset.py 相同的 I/O 效率
+这种方式只需要读取一个矩阵，与 ae_dataset.py 相同的 I/O 效率。
+
+数学上:
+- raw_counts ≈ normalized_counts * (library_size / target_sum)
+- 使用 normalized counts 做 NB loss 是合理的（很多 scVI 变体这样做）
 """
 
 import torch
@@ -23,14 +24,14 @@ import gc
 
 class SomaSCVIDataset(IterableDataset):
     """
-    scVI-style Dataset (Optimized - Merged Matrix)
+    scVI-style Dataset (Fast Version)
 
-    读取合并后的矩阵 [log1p_norm | raw_counts]，然后 split。
+    只读取一个矩阵，使用 expm1 计算 normalized counts。
 
     Yields:
         dict with keys:
             - 'x': log1p(normalized) tensor, shape (batch, n_genes) - Encoder 输入
-            - 'counts': raw counts tensor, shape (batch, n_genes) - NB Loss 目标
+            - 'counts': normalized counts tensor, shape (batch, n_genes) - NB Loss 目标
             - 'library_size': library size tensor, shape (batch,) - Decoder 缩放
     """
 
@@ -43,15 +44,14 @@ class SomaSCVIDataset(IterableDataset):
         measurement_name: str = "RNA",
         preloaded_sub_uris: list = None,
         shard_assignment: dict = None,
-        use_counts_layer: bool = True,  # 保留参数但不使用（兼容性）
+        use_counts_layer: bool = False,  # 保留参数（兼容性），但不使用
     ):
         self.root_dir = root_dir
         self.split_label = split_label
         self.io_chunk_size = io_chunk_size
         self.batch_size = batch_size
         self.measurement_name = measurement_name
-        self._n_vars = None  # 这是合并后的维度 (2 * n_genes)
-        self._n_genes = None  # 实际基因数 (n_genes)
+        self._n_vars = None
         self.shard_assignment = shard_assignment
 
         if preloaded_sub_uris is not None:
@@ -79,7 +79,7 @@ class SomaSCVIDataset(IterableDataset):
 
     @property
     def n_vars(self):
-        """延迟加载特征维度（合并后的维度 = 2 * n_genes）"""
+        """延迟加载特征维度"""
         if self._n_vars is None:
             tmp_ctx = tiledbsoma.SOMATileDBContext()
             try:
@@ -93,13 +93,6 @@ class SomaSCVIDataset(IterableDataset):
                     raise
 
         return self._n_vars
-
-    @property
-    def n_genes(self):
-        """实际基因数量 = n_vars / 2"""
-        if self._n_genes is None:
-            self._n_genes = self.n_vars // 2
-        return self._n_genes
 
     def _get_context(self):
         return tiledbsoma.SOMATileDBContext(tiledb_config={
@@ -143,10 +136,8 @@ class SomaSCVIDataset(IterableDataset):
 
         ctx = self._get_context()
 
-        # 内存池 (合并后的矩阵，包含 x 和 counts)
-        n_vars_total = self.n_vars  # 2 * n_genes
-        n_genes = self.n_genes
-        dense_buffer = np.zeros((self.io_chunk_size, n_vars_total), dtype=np.float32)
+        # 内存池
+        dense_buffer = np.zeros((self.io_chunk_size, self.n_vars), dtype=np.float32)
 
         try:
             for uri in my_worker_uris:
@@ -175,7 +166,7 @@ class SomaSCVIDataset(IterableDataset):
                                 current_len = len(sub_ids)
                                 read_ids = np.sort(sub_ids)
 
-                                # 读取合并后的矩阵 [log1p_norm | raw_counts]
+                                # 读取 X (log1p normalized)
                                 data = X.read(coords=(read_ids, slice(None))).tables().concat()
                                 row_indices = data["soma_dim_0"].to_numpy()
                                 col_indices = data["soma_dim_1"].to_numpy()
@@ -198,12 +189,13 @@ class SomaSCVIDataset(IterableDataset):
                                     if len(batch_idx) <= 1:
                                         continue
 
-                                    # Split: 前 n_genes 列是 log1p_norm，后 n_genes 列是 raw_counts
-                                    batch_data = active_buffer[batch_idx]
-                                    x_batch = batch_data[:, :n_genes].copy()
-                                    counts_batch = batch_data[:, n_genes:].copy()
+                                    # x: log1p(normalized)
+                                    x_batch = active_buffer[batch_idx].copy()
 
-                                    # library_size: sum of raw counts per cell
+                                    # counts: expm1(x) = normalized counts
+                                    counts_batch = np.expm1(x_batch)
+
+                                    # library_size: sum of normalized counts per cell
                                     library_batch = counts_batch.sum(axis=1)
                                     library_batch = np.maximum(library_batch, 1.0)
 

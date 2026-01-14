@@ -3,7 +3,7 @@
 Embryo数据潜空间提取与UMAP可视化脚本
 
 功能：
-1. 加载训练好的 AE 模型
+1. 加载训练好的 AE 模型（支持普通 AE 和 scVI-style AE）
 2. 读取 h5ad 格式的单细胞数据
 3. 将基因对齐到训练数据的基因空间
 4. 通过 AE 编码到 Latent Space
@@ -11,11 +11,19 @@ Embryo数据潜空间提取与UMAP可视化脚本
 6. 保存潜空间表示到 h5ad 文件
 
 使用方法：
+# 普通 AE
 python scripts/embryo/extract_latent_umap.py \
-    --ckpt_path logs/ae_stage1/runs/2025-12-17_06-48-59-ae_large/checkpoints/last.ckpt \
-    --input_h5ad /gpfs/flash/home/jcw/projects/research/Embryo/data/hue11-99457A.h5ad \
+    --ckpt_path logs/ae_stage1/runs/xxx/checkpoints/last.ckpt \
+    --input_h5ad /path/to/data.h5ad \
     --output_dir outputs/embryo \
-    --batch_size 2048
+    --model_type ae
+
+# scVI-style AE
+python scripts/embryo/extract_latent_umap.py \
+    --ckpt_path logs/scvi_ae_sweep/multiruns/xxx/0/checkpoints/last.ckpt \
+    --input_h5ad /path/to/data.h5ad \
+    --output_dir outputs/embryo \
+    --model_type scvi_ae
 """
 
 import os
@@ -109,19 +117,51 @@ def align_genes_to_training(adata: ad.AnnData, training_genes: list) -> np.ndarr
     return X_aligned
 
 
-def load_ae_model(ckpt_path: str, device: torch.device):
-    """加载 AE 模型"""
-    print(f"Loading AE model from: {ckpt_path}")
+def load_ae_model(ckpt_path: str, device: torch.device, model_type: str = "ae"):
+    """
+    加载 AE 模型
+
+    Args:
+        ckpt_path: checkpoint 路径
+        device: 计算设备
+        model_type: 模型类型 ('ae' 或 'scvi_ae')
+
+    Returns:
+        model: 加载的模型
+        cfg: hydra 配置
+    """
+    print(f"Loading {model_type} model from: {ckpt_path}")
 
     # 找到对应的 hydra config
     ckpt_dir = Path(ckpt_path).parent.parent
     config_path = ckpt_dir / ".hydra" / "config.yaml"
 
-    if config_path.exists():
-        print(f"Loading config from: {config_path}")
-        cfg = OmegaConf.load(config_path)
-        # 实例化网络
-        net = instantiate(cfg.model.net)
+    if not config_path.exists():
+        raise ValueError(f"Config not found at {config_path}")
+
+    print(f"Loading config from: {config_path}")
+    cfg = OmegaConf.load(config_path)
+
+    # 实例化网络
+    net = instantiate(cfg.model.net)
+
+    if model_type == "scvi_ae":
+        # scVI-style AE: 直接加载网络权重
+        ckpt = torch.load(ckpt_path, map_location=device)
+        state_dict = ckpt.get("state_dict", ckpt)
+
+        # 移除 "net." 前缀
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("net."):
+                new_state_dict[k[4:]] = v
+            else:
+                new_state_dict[k] = v
+
+        net.load_state_dict(new_state_dict, strict=False)
+        return net, cfg
+    else:
+        # 普通 AE: 使用 AELitModule
         ae_model = AELitModule.load_from_checkpoint(
             ckpt_path,
             net=net,
@@ -129,13 +169,7 @@ def load_ae_model(ckpt_path: str, device: torch.device):
             scheduler=None,
             map_location=device
         )
-        # 返回 config 以获取 data_dir
         return ae_model, cfg
-    else:
-        # fallback: 直接加载（可能会失败）
-        print(f"Warning: Config not found at {config_path}, trying direct load...")
-        ae_model = AELitModule.load_from_checkpoint(ckpt_path, map_location=device)
-        return ae_model, None
 
 
 def extract_latents(
@@ -143,15 +177,17 @@ def extract_latents(
     encoder,
     device: torch.device,
     batch_size: int = 2048,
+    model_type: str = "ae",
 ) -> np.ndarray:
     """
     从表达矩阵提取潜空间表示
 
     Args:
-        X: 表达矩阵 (n_cells, n_genes)
-        encoder: AE 编码器
+        X: 表达矩阵 (n_cells, n_genes)，应该是 log1p normalized
+        encoder: AE 编码器（函数或模型）
         device: 计算设备
         batch_size: 批次大小
+        model_type: 模型类型 ('ae' 或 'scvi_ae')
 
     Returns:
         latents: (n_cells, latent_dim) 的 numpy 数组
@@ -159,7 +195,7 @@ def extract_latents(
     n_cells = X.shape[0]
     n_batches = (n_cells + batch_size - 1) // batch_size
 
-    print(f"Extracting latents for {n_cells} cells...")
+    print(f"Extracting latents for {n_cells} cells (model_type={model_type})...")
 
     latents = []
 
@@ -172,7 +208,15 @@ def extract_latents(
 
         # 编码
         with torch.no_grad():
-            z_batch = encoder(X_batch)
+            if model_type == "scvi_ae":
+                # scVI-style AE: encoder 返回 z 或 (z_mu, z_logvar)
+                z_batch = encoder(X_batch)
+                # 如果是 VAE，返回的是 tuple
+                if isinstance(z_batch, tuple):
+                    z_batch = z_batch[0]  # 取 z_mu
+            else:
+                # 普通 AE
+                z_batch = encoder(X_batch)
 
         latents.append(z_batch.cpu().numpy())
 
@@ -215,17 +259,30 @@ def plot_umap_comparison(
         figsize: 单个子图大小
         dpi: 图片分辨率
     """
+    # 获取可用的 obs 列
+    available_obs_cols = set(adata.obs.columns)
+    print(f"Available obs columns: {list(available_obs_cols)}")
+
     if color_by is None:
         # 尝试自动检测可用的着色列
-        available_cols = []
-        for col in ['cell_type', 'celltype', 'leiden', 'louvain', 'batch', 'sample', 'day', 'time', 'stage', 'Type', 'Types']:
-            if col in adata.obs.columns:
-                available_cols.append(col)
+        candidate_cols = ['cell_type', 'celltype', 'Cell_type', 'CellType',
+                         'leiden', 'louvain', 'batch', 'sample', 'day', 'time',
+                         'stage', 'Stage', 'Type', 'Types', 'cluster', 'Cluster']
+        color_by = [col for col in candidate_cols if col in available_obs_cols]
 
-        if len(available_cols) == 0:
-            color_by = [None]
+        if len(color_by) == 0:
+            color_by = [None]  # 无着色
         else:
-            color_by = available_cols[:4]  # 最多4个
+            color_by = color_by[:4]  # 最多4个
+    else:
+        # 过滤掉不存在的列
+        valid_color_by = []
+        for col in color_by:
+            if col in available_obs_cols:
+                valid_color_by.append(col)
+            else:
+                print(f"Warning: Column '{col}' not found in adata.obs, skipping.")
+        color_by = valid_color_by if valid_color_by else [None]
 
     print(f"Plotting UMAP comparison for: {color_by}")
 
@@ -237,11 +294,13 @@ def plot_umap_comparison(
 
         # 左图：原始数据 UMAP
         adata.obsm['X_umap'] = adata.obsm['X_umap_raw']
-        sc.pl.umap(adata, color=col, ax=axes[0], show=False, frameon=False, title=f'Raw Data UMAP - {col}')
+        title_left = f'Raw Data UMAP' + (f' - {col}' if col else '')
+        sc.pl.umap(adata, color=col, ax=axes[0], show=False, frameon=False, title=title_left)
 
         # 右图：模型潜空间 UMAP
         adata.obsm['X_umap'] = adata.obsm['X_umap_latent']
-        sc.pl.umap(adata, color=col, ax=axes[1], show=False, frameon=False, title=f'Latent Space UMAP - {col}')
+        title_right = f'Latent Space UMAP' + (f' - {col}' if col else '')
+        sc.pl.umap(adata, color=col, ax=axes[1], show=False, frameon=False, title=title_right)
 
         plt.tight_layout()
 
@@ -265,6 +324,8 @@ def main():
     parser.add_argument("--save_latent", action="store_true", default=True, help="保存潜空间到 h5ad")
     parser.add_argument("--training_data_dir", type=str, default=None,
                         help="训练数据目录（用于基因对齐），如不指定则从 config 读取")
+    parser.add_argument("--model_type", type=str, default="ae", choices=["ae", "scvi_ae"],
+                        help="模型类型: 'ae' (普通 AE) 或 'scvi_ae' (scVI-style AE)")
 
     args = parser.parse_args()
 
@@ -284,11 +345,22 @@ def main():
     print(f"Using device: {device}")
 
     # 4. 加载 AE 模型
-    ae_model, cfg = load_ae_model(args.ckpt_path, device)
-    ae_model.eval()
-    ae_model.to(device)
-    encoder = ae_model.net.encode
-    print(f"Model loaded on {device}")
+    model, cfg = load_ae_model(args.ckpt_path, device, model_type=args.model_type)
+    model.eval()
+    model.to(device)
+
+    # 获取编码器
+    if args.model_type == "scvi_ae":
+        # scVI-style AE: 使用 encode 方法或 get_latent 方法
+        if hasattr(model, 'get_latent'):
+            encoder = model.get_latent
+        else:
+            encoder = model.encode
+    else:
+        # 普通 AE: 使用 net.encode
+        encoder = model.net.encode
+
+    print(f"Model loaded on {device} (type={args.model_type})")
 
     # 5. 获取训练数据的基因列表
     if args.training_data_dir:
@@ -312,47 +384,53 @@ def main():
     print("Aligning genes to training data...")
     X_aligned = align_genes_to_training(adata, training_genes)
 
-    # 8. 提取潜空间
+    # 8. 数据预处理检查
+    # 确保数据是 log1p normalized（scvi_ae 需要）
+    if X_aligned.max() > 50:
+        print("Warning: Data seems not log1p normalized. Applying log1p...")
+        X_aligned = np.log1p(X_aligned)
+
+    # 9. 提取潜空间
     latents = extract_latents(
         X=X_aligned,
         encoder=encoder,
         device=device,
         batch_size=args.batch_size,
+        model_type=args.model_type,
     )
 
-    # 9. 存储潜空间到 adata
+    # 10. 存储潜空间到 adata
     adata.obsm['X_latent'] = latents
 
-    # 10. 计算原始数据的 UMAP（基于 PCA）
+    # 11. 计算原始数据的 UMAP（基于 PCA）
     print("\n--- Computing Raw Data UMAP (PCA-based) ---")
-    # 先做 PCA
     sc.pp.pca(adata, n_comps=50)
     sc.pp.neighbors(adata, use_rep='X_pca', n_neighbors=args.n_neighbors)
     sc.tl.umap(adata)
-    # 保存原始数据的 UMAP
     adata.obsm['X_umap_raw'] = adata.obsm['X_umap'].copy()
 
-    # 11. 计算模型潜空间的 UMAP
+    # 12. 计算模型潜空间的 UMAP
     print("\n--- Computing Latent Space UMAP ---")
     sc.pp.neighbors(adata, use_rep='X_latent', n_neighbors=args.n_neighbors)
     sc.tl.umap(adata)
-    # 保存潜空间的 UMAP
     adata.obsm['X_umap_latent'] = adata.obsm['X_umap'].copy()
 
-    # 12. 绘制对比 UMAP（每个 color_by 一张图，左右对比）
+    # 13. 绘制对比 UMAP
     input_name = Path(args.input_h5ad).stem
-    umap_path = os.path.join(args.output_dir, f"{input_name}_umap.png")
+    model_suffix = f"_{args.model_type}" if args.model_type != "ae" else ""
+    umap_path = os.path.join(args.output_dir, f"{input_name}{model_suffix}_umap.png")
     plot_umap_comparison(adata, umap_path, color_by=args.color_by)
 
-    # 13. 保存带有潜空间的 h5ad
+    # 14. 保存带有潜空间的 h5ad
     if args.save_latent:
-        output_h5ad = os.path.join(args.output_dir, f"{input_name}_with_latent.h5ad")
+        output_h5ad = os.path.join(args.output_dir, f"{input_name}{model_suffix}_with_latent.h5ad")
         print(f"Saving h5ad with latent to: {output_h5ad}")
         adata.write_h5ad(output_h5ad)
 
-    # 14. 总结
+    # 15. 总结
     print("\n" + "=" * 50)
     print("Done!")
+    print(f"  - Model type: {args.model_type}")
     print(f"  - Latent dim: {latents.shape[1]}")
     print(f"  - UMAP comparison saved to: {args.output_dir}")
     if args.save_latent:

@@ -2,8 +2,8 @@
 
 defaults:
   - _self_
-  - data: sc_atlas_ae
-  - model: ae_stage1
+  - data: rtf_tedd
+  - model: flow_stage2_cfg
   - callbacks: default
   - logger: wandb
   - trainer: default
@@ -11,7 +11,7 @@ defaults:
   - extra: default
   - hydra: default
   - experiment: null
-task_name: "ae_stage1"
+task_name: "rtf_only"
 train: True
 test: False
 seed: 42

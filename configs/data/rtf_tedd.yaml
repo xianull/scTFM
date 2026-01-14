@@ -20,7 +20,7 @@ data_dir: ${data.raw_data_dir}
 latent_dir: null
 
 # 批次大小（根据 model.mode 自动调整）
-batch_size: 512
+batch_size: 256
 
 # DataLoader 参数
 num_workers: 8
