@@ -1,0 +1,41 @@
+# 一致性训练数据配置 (TEDD 数据集)
+
+_target_: src.data.consistency_datamodule.ConsistencyDataModule
+
+# 数据路径
+data_dir: /fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+# 批次大小（序列训练需要更小的 batch）
+batch_size: 64
+
+# DataLoader 参数
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+
+# TileDB 参数
+io_chunk_size: 16384
+
+# ===================================================================
+# [一致性训练特有配置]
+# ===================================================================
+
+# 最大时间筛选（天）- 只保留该时间内的细胞
+max_time_days: 100.0
+
+# 序列长度范围
+min_seq_len: 2   # 最小序列长度
+max_seq_len: 5   # 最大序列长度
+
+# Latent Key
+latent_key: null
+
+# 智能负载均衡
+shard_assignment: null
+
+# Stage 信息
+stage_info_path: /gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/tedd_info.csv
+
+# 时间归一化（100天内用线性归一化即可）
+use_log_time: false

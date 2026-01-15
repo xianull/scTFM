@@ -1,0 +1,31 @@
+# ContrastiveSetAE - 对比学习自编码器
+#
+# 方案二: 对比学习自编码器
+# 通过 InfoNCE 损失强制 Latent 空间在局部邻域内保持平滑
+# 正样本：空间邻居细胞
+# 负样本：随机采样的非邻居细胞
+
+_target_: src.models.components.ae.set_scae.SetSCAE
+
+strategy: "contrastive"
+
+# 基础参数
+n_input: 28231
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布
+dispersion: "gene"
+gene_likelihood: "nb"
+
+# 集合大小
+set_size: 16
+
+# ContrastiveSetAE 特定参数
+contrastive_weight: 0.1
+temperature: 0.1
+n_negatives: 64

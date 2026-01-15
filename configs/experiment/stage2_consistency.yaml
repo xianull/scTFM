@@ -1,0 +1,123 @@
+# @package _global_
+#
+# Stage 2: Consistency Flow Training (时间链一致性训练)
+#
+# 使用方法:
+#   python src/train.py experiment=stage2_consistency \
+#     model.ae_ckpt_path=logs/ae_stage1/runs/.../checkpoints/xxx.ckpt
+
+defaults:
+  - override /data: consistency_tedd
+  - override /model: flow_consistency_cfg
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "consistency_flow"
+
+tags: ["consistency", "flow", "chain", "stage2"]
+
+seed: 42
+
+# =============================================================================
+# Trainer
+# =============================================================================
+trainer:
+  min_epochs: 5
+  max_epochs: 10
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU
+  accelerator: gpu
+  devices: [2,3,4,5]
+  strategy: ddp_find_unused_parameters_true  # 允许未使用参数
+
+  # 不使用验证集
+  limit_val_batches: 0
+  num_sanity_val_steps: 0
+
+# =============================================================================
+# Model
+# =============================================================================
+model:
+  # 模式选择: "latent" (需要 ae_ckpt_path) 或 "raw" (直接用原始表达)
+  mode: raw
+  flow_type: rectified_flow
+
+  # Latent 模式需要指定 AE checkpoint
+  ae_ckpt_path: null  # 示例: logs/ae_stage1/checkpoints/best.ckpt
+
+  # Loss 权重
+  lambda_skip: 0.5
+  lambda_cons: 0.1
+
+  # 采样步数（减少以加速训练，Euler 方法 3-5 步通常够用）
+  sample_steps: 3
+
+  # 每 N 步计算一次一致性 loss（加速训练，一致性 loss 开销大）
+  cons_every_n_steps: 1
+
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    _partial_: true
+    T_max: 200
+    eta_min: 1e-6
+
+  net:
+    input_dim: 28231  # Raw 模式需要指定基因数
+    hidden_size: 512  # 减小以节省显存
+    depth: 12          # 减小以节省显存
+    num_heads: 16
+    mlp_ratio: 4.0
+    dropout: 0.0
+    cond_dropout: 0.15
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  batch_size: 256  # 序列训练需要更小的 batch
+  num_workers: 16  # 每 GPU 4 workers，提升数据加载速度
+  prefetch_factor: 4  # 预取更多数据
+  max_time_days: 100.0
+  min_seq_len: 2
+  max_seq_len: 5
+
+# =============================================================================
+# Callbacks - 使用 TQDMProgressBar 避免 DDP 输出混乱
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-train_loss_{train/loss:.4f}"
+    monitor: "train/loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+    auto_insert_metric_name: false
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "train/loss"
+    patience: 30
+    mode: "min"
+
+  rich_progress_bar:
+    _target_: pytorch_lightning.callbacks.RichProgressBar
+    refresh_rate: 1
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-Consistency"
+    name: "${task_name}_skip${model.lambda_skip}_cons${model.lambda_cons}"
+    tags: ${tags}
+    group: "consistency_flow"

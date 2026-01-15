@@ -6,10 +6,14 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple, List, Dict
 import heapq
 
-def _count_one_shard(args: Tuple[str, int]) -> Tuple[str, int]:
+def _count_one_shard(args) -> Tuple[str, int]:
     """
-    单个 Worker 的任务：计算一个分片里符合 split_label 的细胞数
+    单个 Worker 的任务：计算一个分片里符合条件的细胞数
     必须是顶层函数，以便 pickle 序列化。
+    
+    Args:
+        args: (uri, split_label) 或 (uri, None)
+              split_label=None 时不筛选，统计全部细胞
     
     Returns:
         (shard_name, cell_count)
@@ -19,10 +23,14 @@ def _count_one_shard(args: Tuple[str, int]) -> Tuple[str, int]:
         # 显式创建独立的 Context，避免多进程共享 Context 导致的 C++ 层死锁
         ctx = tiledbsoma.SOMATileDBContext()
         with tiledbsoma.Experiment.open(uri, context=ctx) as exp:
-            query = exp.obs.read(
-                value_filter=f"split_label == {split_label}",
-                column_names=["soma_joinid"]
-            ).concat()
+            if split_label is not None:
+                query = exp.obs.read(
+                    value_filter=f"split_label == {split_label}",
+                    column_names=["soma_joinid"]
+                ).concat()
+            else:
+                # 不筛选，统计全部细胞
+                query = exp.obs.read(column_names=["soma_joinid"]).concat()
             shard_name = os.path.basename(uri)
             return (shard_name, len(query))
     except Exception:
@@ -84,8 +92,8 @@ def balanced_shard_assignment(
 
 def get_dataset_stats(
     root_dir: str, 
-    split_label: int, 
-    batch_size: int, 
+    split_label: int = None, 
+    batch_size: int = 256, 
     num_workers: int = 16, 
     world_size: int = 1,
     num_workers_per_gpu: int = 16
@@ -95,7 +103,7 @@ def get_dataset_stats(
     
     Args:
         root_dir: 数据集根目录
-        split_label: 0=Train, 1=Val
+        split_label: 0=Train, 1=Val, None=不筛选（统计全部细胞）
         batch_size: 单卡 Batch Size
         num_workers: 并行扫描的进程数 (建议设为 CPU 核心数的一半)
         world_size: DDP 总 GPU 数
@@ -117,7 +125,8 @@ def get_dataset_stats(
     if not sub_uris:
         return 0, 0, {}
     
-    print(f"📊 [Stats] 启动多进程扫描 {len(sub_uris)} 个 Shards (Split={split_label})...")
+    split_info = f"Split={split_label}" if split_label is not None else "All"
+    print(f"📊 [Stats] 启动多进程扫描 {len(sub_uris)} 个 Shards ({split_info})...")
     
     # 准备任务参数
     tasks = [(uri, split_label) for uri in sub_uris]

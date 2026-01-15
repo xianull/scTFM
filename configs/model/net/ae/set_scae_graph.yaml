@@ -1,0 +1,30 @@
+# GraphSetAE - 基于GAT的图自编码器
+#
+# 方案一: 空间图自编码器
+# 通过图卷积（GAT）在编码阶段引入微环境信息
+# 双重解码器：特征重建 + 链路预测
+
+_target_: src.models.components.ae.set_scae.SetSCAE
+
+strategy: "graph"
+
+# 基础参数
+n_input: 28231
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布
+dispersion: "gene"
+gene_likelihood: "nb"
+
+# 集合大小
+set_size: 16
+
+# GraphSetAE 特定参数
+n_gat_layers: 2
+n_heads: 4
+link_pred_weight: 0.1

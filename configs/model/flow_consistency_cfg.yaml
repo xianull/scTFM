@@ -1,0 +1,65 @@
+# @package _global_
+
+defaults:
+  - net/backbone@model.net: dit_cross_attn
+  - _self_
+
+model:
+  _target_: src.models.consistency_flow_module.ConsistencyFlowLitModule
+
+  # ===================================================================
+  # [核心参数] 模式选择: latent (推荐) 或 raw
+  # ===================================================================
+  mode: raw  # "latent" 或 "raw"
+
+  # Flow 模型类型
+  flow_type: rectified_flow
+
+  # ===================================================================
+  # [Latent 模式配置] AE Checkpoint 路径
+  # ===================================================================
+  ae_ckpt_path: null  # 示例: "logs/ae_stage1/checkpoints/best.ckpt"
+
+  # ===================================================================
+  # [一致性训练特有配置]
+  # ===================================================================
+  # Loss 权重
+  lambda_skip: 0.5    # 跨步监督权重
+  lambda_cons: 0.1    # 一致性约束权重（较小，因为计算开销大）
+
+  # 采样参数
+  sample_steps: 10
+  cons_every_n_steps: 10  # 每 N 步计算一次一致性 loss（加速训练）
+
+  # ===================================================================
+  # 优化器
+  # ===================================================================
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  # 学习率调度
+  scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    _partial_: true
+    T_max: 200
+    eta_min: 1e-6
+
+# ===================================================================
+# 与 flow_stage2_cfg.yaml 的区别
+# ===================================================================
+#
+# 1. 支持时间链一致性训练:
+#    - L_step: 逐步监督（相邻对 Flow loss）
+#    - L_skip: 跨步监督（起点直接预测终点）
+#    - L_consistency: 一致性约束（直接预测 ≈ 链式预测）
+#
+# 2. 输入为细胞序列而非细胞对:
+#    - x_seq: [B, L, D] 细胞序列
+#    - time_seq: [B, L] 时间序列
+#    - seq_len: [B] 实际序列长度
+#
+# 3. Loss 公式:
+#    L_total = L_step + λ_skip * L_skip + λ_cons * L_consistency

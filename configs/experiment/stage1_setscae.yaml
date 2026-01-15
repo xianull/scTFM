@@ -1,0 +1,122 @@
+# @package _global_
+#
+# Stage 1: SetSCAE Training (Set Single-Cell Autoencoder)
+#
+# 用于训练微环境感知的单细胞自编码器
+# 支持三种策略:
+#   - graph: GAT-based 图自编码器
+#   - contrastive: 对比学习自编码器 (推荐)
+#   - masked: 掩码自编码器
+#
+# 使用方法:
+#   # 同时跑三种策略 (multirun)
+#   python src/train.py experiment=stage1_setscae --multirun
+#
+#   # 单独跑一种策略
+#   python src/train.py experiment=stage1_setscae hydra.mode=RUN model.net.strategy=graph
+
+defaults:
+  - override /data: neighborhood_tedd
+  - override /model: setscae_stage1
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "setscae_stage1"
+
+tags: ["setscae", "ae", "neighborhood", "stage1"]
+
+seed: 42
+
+# =============================================================================
+# Trainer
+# =============================================================================
+trainer:
+  min_epochs: 5
+  max_epochs: 50
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU 配置
+  accelerator: gpu
+  devices: [0]
+  # strategy: ddp  # 多卡时启用
+
+# =============================================================================
+# Model
+# =============================================================================
+model:
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  # 网络配置
+  net:
+    # 策略选择: 'graph', 'contrastive', 'masked'
+    strategy: "contrastive"
+
+    # 基础参数
+    n_input: 28231
+    n_hidden: 256
+    n_latent: 64
+    n_layers: 2
+    dropout_rate: 0.1
+
+    # 集合大小
+    set_size: 128
+
+    # === Contrastive 策略参数 ===
+    contrastive_weight: 0.1
+    temperature: 0.1
+    n_negatives: 64
+
+    # === Graph 策略参数 ===
+    n_gat_layers: 2
+    n_heads: 4
+    link_pred_weight: 0.1
+
+    # === Masked 策略参数 ===
+    n_context_layers: 2
+    mask_ratio: 0.3
+    mask_strategy: "random"
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  bag_size: 128  # 与 model.net.set_size 一致
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+    auto_insert_metric_name: false
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-SetSCAE"
+    name: "${task_name}_${model.net.strategy}"
+    tags: ${tags}
+    group: "setscae_stage1"
+
+# =============================================================================
+# Hydra Multirun - 同时跑三种策略
+# =============================================================================
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      model.net.strategy: graph,contrastive,masked

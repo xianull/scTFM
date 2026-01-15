@@ -234,9 +234,12 @@ def main(cfg: DictConfig):
                 
                 from src.utils.dataset_stats_utils import balanced_shard_assignment
                 
+                # 一致性训练任务不使用 split_label 筛选
+                split_label = None if task_name == "consistency_flow" else 0
+                
                 total_cells, total_steps, shard_sizes = get_dataset_stats(
                     root_dir=data_dir,
-                    split_label=0, 
+                    split_label=split_label, 
                     batch_size=batch_size,
                     num_workers=16,  # 只有一个进程计算，可以开大
                     world_size=world_size,
@@ -269,14 +272,16 @@ def main(cfg: DictConfig):
                 else:
                     log.warning(f"⚠️ [Rank {local_rank}] Cache not found, recalculating...")
                     from src.utils.dataset_stats_utils import balanced_shard_assignment
+                    split_label = None if task_name == "consistency_flow" else 0
                     total_cells, total_steps, shard_sizes = get_dataset_stats(
-                        root_dir=data_dir, split_label=0, 
+                        root_dir=data_dir, split_label=split_label, 
                         batch_size=batch_size, num_workers=4, world_size=world_size,
                         num_workers_per_gpu=num_workers_per_gpu
                     )
             
             # 设置配置
-            if total_steps > 0:
+            # 一致性训练的 batch 数取决于链数量而非细胞数，不使用 limit_train_batches
+            if total_steps > 0 and task_name != "consistency_flow":
                 OmegaConf.set_struct(cfg, False)
                 cfg.trainer.limit_train_batches = total_steps
                 OmegaConf.set_struct(cfg, True)

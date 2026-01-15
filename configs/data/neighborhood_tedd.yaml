@@ -1,0 +1,36 @@
+# Neighborhood Dataset 配置 (TEDD 数据集)
+#
+# 用于 SetSCAE 训练的微环境采样数据集
+# 每个 batch 返回 (batch_size, bag_size, n_genes) 的细胞集合
+
+_target_: src.data.neighborhood_datamodule.NeighborhoodDataModule
+
+# 数据路径
+data_dir: /fast/data/scTFM/rtf/TEDD/tile_4000_fix
+
+# 批次大小（细胞集合数量）
+batch_size: 64
+
+# DataLoader 参数
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+
+# TileDB 参数
+io_chunk_size: 16384
+
+# 数据集划分
+split_label_train: 0
+split_label_val: 1
+
+# =============================================================================
+# 微环境采样参数
+# =============================================================================
+
+# 每个微环境 bag 中的细胞数量（中心 + 邻居）
+bag_size: 16
+
+# Masked AE 参数（仅当使用 masked 策略时生效）
+mask_ratio: 0.0  # 0 表示不使用掩码
+mask_strategy: "random"  # "random" | "hvg"

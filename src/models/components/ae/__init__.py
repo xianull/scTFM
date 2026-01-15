@@ -7,6 +7,13 @@ from .vae import VariationalAE
 from .scae import SCAE, ResidualBlock, ResidualEncoder, ResidualDecoder
 from .scvae import SCVAE
 from .losses import NBLoss, ZINBLoss, GaussianLoss, SCLoss
+from .set_scae import (
+    SetSCAE,
+    GraphSetAE,
+    ContrastiveSetAE,
+    MaskedSetAE,
+    BaseSetSCAE,
+)
 
 __all__ = [
     "VanillaAE",
@@ -20,4 +27,10 @@ __all__ = [
     "ZINBLoss",
     "GaussianLoss",
     "SCLoss",
+    # SetSCAE 系列
+    "SetSCAE",
+    "GraphSetAE",
+    "ContrastiveSetAE",
+    "MaskedSetAE",
+    "BaseSetSCAE",
 ]

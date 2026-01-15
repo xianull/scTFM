@@ -1,0 +1,71 @@
+# Set Single-Cell Autoencoder (SetSCAE)
+#
+# 用于建模细胞微环境的自编码器框架
+# 支持三种策略:
+# - graph: 基于GAT的图自编码器 (GraphSetAE)
+# - contrastive: 对比学习自编码器 (ContrastiveSetAE)
+# - masked: 掩码自编码器 (MaskedSetAE)
+#
+# 核心设计:
+# - 输入是细胞集合 (中心细胞 + 邻居细胞)
+# - 同时建模单细胞表达和微环境上下文
+# - 使用 scVI 风格的 NB 分布建模 count 数据
+
+_target_: src.models.components.ae.set_scae.SetSCAE
+
+# =============================================================================
+# 策略选择 (核心参数)
+# =============================================================================
+# 可选: 'graph', 'contrastive', 'masked'
+strategy: "contrastive"
+
+# =============================================================================
+# 基础网络参数
+# =============================================================================
+# 基因数 (会被数据集覆盖)
+n_input: 28231
+
+# 网络结构
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+
+# 正则化
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布参数
+dispersion: "gene"        # 'gene' (推荐) 或 'gene-cell'
+gene_likelihood: "nb"     # 'nb' 或 'zinb'
+
+# 集合大小 (中心细胞 + 邻居数)
+set_size: 16
+
+# =============================================================================
+# 策略特定参数
+# =============================================================================
+
+# --- GraphSetAE 参数 ---
+# GAT 层数
+n_gat_layers: 2
+# 注意力头数
+n_heads: 4
+# 链路预测损失权重
+link_pred_weight: 0.1
+
+# --- ContrastiveSetAE 参数 ---
+# 对比损失权重
+contrastive_weight: 0.1
+# 温度参数
+temperature: 0.1
+# 负样本数量
+n_negatives: 64
+
+# --- MaskedSetAE 参数 ---
+# 上下文 Transformer 层数
+n_context_layers: 2
+# 掩码比例
+mask_ratio: 0.3
+# 掩码策略: 'random', 'hvg', 'block'
+mask_strategy: "random"

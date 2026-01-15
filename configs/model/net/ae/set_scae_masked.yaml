@@ -1,0 +1,33 @@
+# MaskedSetAE - 掩码自编码器
+#
+# 方案三: 上下文感知的掩码自编码器
+# 借鉴 MAE/scGPT 的思路，通过预测被掩码的信息来学习微环境
+# - 输入：中心细胞 + 邻居细胞
+# - 掩码：随机遮盖中心细胞的部分基因
+# - 预测：利用邻居信息预测被遮盖的基因
+
+_target_: src.models.components.ae.set_scae.SetSCAE
+
+strategy: "masked"
+
+# 基础参数
+n_input: 28231
+n_hidden: 256
+n_latent: 64
+n_layers: 2
+dropout_rate: 0.1
+activation: "GELU"
+use_residual: true
+
+# NB 分布
+dispersion: "gene"
+gene_likelihood: "nb"
+
+# 集合大小
+set_size: 16
+
+# MaskedSetAE 特定参数
+n_context_layers: 2
+n_heads: 4
+mask_ratio: 0.3
+mask_strategy: "random"  # 'random', 'hvg', 'block'

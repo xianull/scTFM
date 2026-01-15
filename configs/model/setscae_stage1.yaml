@@ -1,0 +1,27 @@
+# SetSCAE Stage 1 Model Configuration
+#
+# 用于训练 Set Single-Cell Autoencoder
+# 支持三种策略: graph, contrastive, masked
+
+defaults:
+  - net/ae@model.net: set_scae
+  - _self_
+
+model:
+  _target_: src.models.setscae_module.SetSCAELitModule
+
+  # 中心细胞索引（通常为 0）
+  center_idx: 0
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  scheduler:
+    _target_: torch.optim.lr_scheduler.ReduceLROnPlateau
+    _partial_: true
+    mode: min
+    factor: 0.5
+    patience: 5
