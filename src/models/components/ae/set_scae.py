@@ -458,6 +458,10 @@ class GraphSetAE(BaseSetSCAE):
         # 潜在空间投影 (覆盖基类)
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
+        # 冻结未使用的 cell_encoder (GraphSetAE 使用 input_proj + GAT 替代)
+        for param in self.cell_encoder.parameters():
+            param.requires_grad = False
+
     def forward(
         self,
         x_set: torch.Tensor,
@@ -493,19 +497,28 @@ class GraphSetAE(BaseSetSCAE):
         z_all = self.z_mean(h)  # (batch, set_size, n_latent)
         z_center = z_all[:, center_idx, :]  # (batch, n_latent)
 
-        # 解码中心细胞
-        center_lib = library_size[:, center_idx]
-        outputs = self.decode_cell(z_center, center_lib)
+        # 解码所有细胞 (不仅仅是中心细胞)
+        z_flat = z_all.view(-1, z_all.size(-1))  # (batch * set_size, n_latent)
+        lib_flat = library_size.view(-1)  # (batch * set_size,)
+        decoded = self.decode_cell(z_flat, lib_flat)
+
+        # reshape 回 (batch, set_size, n_genes)
+        mu_all = decoded['mu'].view(batch_size, set_size, -1)
+        theta_all = decoded['theta'].view(batch_size, set_size, -1)
 
         # 链路预测 (内积)
         z_norm = F.normalize(z_all, dim=-1)
         adj_pred = torch.bmm(z_norm, z_norm.transpose(1, 2))
 
-        outputs.update({
+        outputs = {
             'z_all': z_all,
             'z_center': z_center,
+            'mu_all': mu_all,
+            'theta_all': theta_all,
+            'mu': mu_all[:, center_idx, :],  # 兼容旧接口
+            'theta': theta_all[:, center_idx, :],
             'adj_pred': adj_pred,
-        })
+        }
 
         return outputs
 
@@ -518,18 +531,20 @@ class GraphSetAE(BaseSetSCAE):
         center_idx: int = 0,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
-        """计算损失"""
+        """计算损失 (重建所有细胞)"""
         from .losses import log_nb_positive
 
-        # 重建损失 (中心细胞)
+        # 重建损失 (所有细胞)
         if raw_counts is not None:
-            target = raw_counts[:, center_idx, :]
+            target = raw_counts  # (batch, set_size, n_genes)
         else:
-            target = torch.expm1(x_set[:, center_idx, :])
+            target = torch.expm1(x_set)  # (batch, set_size, n_genes)
 
-        mu = outputs['mu']
-        theta = outputs['theta']
-        log_prob = log_nb_positive(target, mu, theta)
+        mu_all = outputs['mu_all']  # (batch, set_size, n_genes)
+        theta_all = outputs['theta_all']  # (batch, set_size, n_genes)
+
+        # 计算所有细胞的 NB log prob
+        log_prob = log_nb_positive(target, mu_all, theta_all)  # (batch, set_size, n_genes)
         recon_loss = -log_prob.mean()
 
         # 链路预测损失
@@ -636,16 +651,24 @@ class ContrastiveSetAE(BaseSetSCAE):
         proj_all = self.projection_head(z_all)
         proj_center = proj_all[:, center_idx, :]
 
-        # 解码中心细胞
-        center_lib = library_size[:, center_idx]
-        outputs = self.decode_cell(z_center, center_lib)
+        # 解码所有细胞 (不仅仅是中心细胞)
+        lib_flat = library_size.view(-1)  # (batch * set_size,)
+        decoded = self.decode_cell(z_flat, lib_flat)
 
-        outputs.update({
+        # reshape 回 (batch, set_size, n_genes)
+        mu_all = decoded['mu'].view(batch_size, set_size, -1)
+        theta_all = decoded['theta'].view(batch_size, set_size, -1)
+
+        outputs = {
             'z_all': z_all,
             'z_center': z_center,
             'proj_all': proj_all,
             'proj_center': proj_center,
-        })
+            'mu_all': mu_all,
+            'theta_all': theta_all,
+            'mu': mu_all[:, center_idx, :],  # 兼容旧接口
+            'theta': theta_all[:, center_idx, :],
+        }
 
         return outputs
 
@@ -717,18 +740,19 @@ class ContrastiveSetAE(BaseSetSCAE):
         center_idx: int = 0,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
-        """计算损失"""
+        """计算损失 (重建所有细胞)"""
         from .losses import log_nb_positive
 
-        # 重建损失
+        # 重建损失 (所有细胞)
         if raw_counts is not None:
-            target = raw_counts[:, center_idx, :]
+            target = raw_counts  # (batch, set_size, n_genes)
         else:
-            target = torch.expm1(x_set[:, center_idx, :])
+            target = torch.expm1(x_set)  # (batch, set_size, n_genes)
 
-        mu = outputs['mu']
-        theta = outputs['theta']
-        log_prob = log_nb_positive(target, mu, theta)
+        mu_all = outputs['mu_all']  # (batch, set_size, n_genes)
+        theta_all = outputs['theta_all']  # (batch, set_size, n_genes)
+
+        log_prob = log_nb_positive(target, mu_all, theta_all)
         recon_loss = -log_prob.mean()
 
         # 对比损失
@@ -839,6 +863,10 @@ class MaskedSetAE(BaseSetSCAE):
         # 潜在空间投影
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
+        # 冻结未使用的 cell_encoder (MaskedSetAE 使用 input_proj + context_encoder 替代)
+        for param in self.cell_encoder.parameters():
+            param.requires_grad = False
+
     def create_mask(
         self,
         x: torch.Tensor,
@@ -938,19 +966,30 @@ class MaskedSetAE(BaseSetSCAE):
         # 预测被掩码的基因
         pred_genes = self.prediction_head(h_center_context)
 
-        # 获取潜在表征
-        z_center = self.z_mean(h_center_context)
+        # 获取所有细胞的潜在表征
+        z_all = self.z_mean(h_context)  # (batch, set_size, n_latent)
+        z_center = z_all[:, center_idx, :]
 
-        # 解码 (用于重建损失)
-        center_lib = library_size[:, center_idx]
-        outputs = self.decode_cell(z_center, center_lib)
+        # 解码所有细胞 (不仅仅是中心细胞)
+        z_flat = z_all.view(-1, z_all.size(-1))  # (batch * set_size, n_latent)
+        lib_flat = library_size.view(-1)  # (batch * set_size,)
+        decoded = self.decode_cell(z_flat, lib_flat)
 
-        outputs.update({
+        # reshape 回 (batch, set_size, n_genes)
+        mu_all = decoded['mu'].view(batch_size, set_size, -1)
+        theta_all = decoded['theta'].view(batch_size, set_size, -1)
+
+        outputs = {
+            'z_all': z_all,
             'z_center': z_center,
             'pred_genes': pred_genes,
             'gene_mask': gene_mask,
             'h_context': h_context,
-        })
+            'mu_all': mu_all,
+            'theta_all': theta_all,
+            'mu': mu_all[:, center_idx, :],  # 兼容旧接口
+            'theta': theta_all[:, center_idx, :],
+        }
 
         return outputs
 
@@ -962,21 +1001,22 @@ class MaskedSetAE(BaseSetSCAE):
         center_idx: int = 0,
         **kwargs
     ) -> Dict[str, torch.Tensor]:
-        """计算损失"""
+        """计算损失 (重建所有细胞)"""
         from .losses import log_nb_positive
 
-        # 重建损失 (NB)
+        # 重建损失 (所有细胞)
         if raw_counts is not None:
-            target = raw_counts[:, center_idx, :]
+            target = raw_counts  # (batch, set_size, n_genes)
         else:
-            target = torch.expm1(x_set[:, center_idx, :])
+            target = torch.expm1(x_set)  # (batch, set_size, n_genes)
 
-        mu = outputs['mu']
-        theta = outputs['theta']
-        log_prob = log_nb_positive(target, mu, theta)
+        mu_all = outputs['mu_all']  # (batch, set_size, n_genes)
+        theta_all = outputs['theta_all']  # (batch, set_size, n_genes)
+
+        log_prob = log_nb_positive(target, mu_all, theta_all)
         recon_loss = -log_prob.mean()
 
-        # 掩码预测损失 (只计算被掩码的基因)
+        # 掩码预测损失 (只计算中心细胞被掩码的基因)
         gene_mask = outputs['gene_mask']
         pred_genes = outputs['pred_genes']
         x_center = x_set[:, center_idx, :]

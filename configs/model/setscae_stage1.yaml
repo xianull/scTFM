@@ -1,9 +1,11 @@
-# SetSCAE Stage 1 Model Configuration
+# @package _global_
 #
+# SetSCAE Stage 1 Model Configuration
 # 用于训练 Set Single-Cell Autoencoder
 # 支持三种策略: graph, contrastive, masked
 
 defaults:
+  # 依赖注入：将 net/ae/set_scae.yaml 的内容挂载到 model.net 节点
   - net/ae@model.net: set_scae
   - _self_
 

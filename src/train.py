@@ -267,6 +267,7 @@ def main(cfg: DictConfig):
                 # DDP 子进程：读取缓存
                 if cache_file.exists():
                     stats = json.loads(cache_file.read_text())
+                    total_cells = stats.get("total_cells", 0)
                     total_steps = stats["total_steps"]
                     log.info(f"📥 [Rank {local_rank}] Loaded from cache: {total_steps} steps")
                 else:
@@ -281,7 +282,17 @@ def main(cfg: DictConfig):
             
             # 设置配置
             # 一致性训练的 batch 数取决于链数量而非细胞数，不使用 limit_train_batches
-            if total_steps > 0 and task_name != "consistency_flow":
+            if total_steps > 0 and task_name == "consistency_flow":
+                pass  # 跳过，让 PyTorch Lightning 自动检测
+            elif total_steps > 0 and task_name == "setscae_stage1":
+                # SetSCAE: 需要考虑 bag_size
+                bag_size = cfg.data.get("bag_size", 16)
+                actual_steps = max(1, total_cells // bag_size // batch_size // world_size)
+                OmegaConf.set_struct(cfg, False)
+                cfg.trainer.limit_train_batches = actual_steps
+                OmegaConf.set_struct(cfg, True)
+                log.info(f"📊 [SetSCAE] Adjusted steps: {total_steps} → {actual_steps} (bag_size={bag_size})")
+            elif total_steps > 0:
                 OmegaConf.set_struct(cfg, False)
                 cfg.trainer.limit_train_batches = total_steps
                 OmegaConf.set_struct(cfg, True)

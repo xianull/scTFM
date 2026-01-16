@@ -32,8 +32,8 @@ seed: 42
 # Trainer
 # =============================================================================
 trainer:
-  min_epochs: 5
-  max_epochs: 50
+  min_epochs: 2
+  max_epochs: 2
   gradient_clip_val: 1.0
   precision: 16-mixed
 
@@ -85,7 +85,7 @@ model:
 # =============================================================================
 data:
   batch_size: 64
-  num_workers: 8
+  num_workers: 16  # 不要设置太高，避免 TileDB 并发死锁
   bag_size: 128  # 与 model.net.set_size 一致
 
 # =============================================================================
