@@ -42,8 +42,47 @@ recon_loss = -log_nb_positive(target, mu_all, theta_all).mean()
 - 每个 forward pass 中，轮流让 bag 中的每个细胞作为中心，计算所有细胞的重建损失。
     - 折中方案，如果每个细胞再随机采的话太慢了
 
+### 2026-01-18
+模型路径：`/fast/projects/scTFM/models/ae/setaev0_2`
+- GraphSetAE 和 MaskedSetAE 继承自 BaseSetSCAE，基类创建了cell_encoder，但这两个策略没有使用它，导致 DDP 检测到未使用的参数。
+- 基于 Stack 论文的条件嵌入方法
+  - 上下文聚合（context_aggregation）：
+    - mean: 简单平均邻居表征
+    - attention: 多头注意力聚合（默认）
+    - max: 最大池化
+  - 条件注入（condition_injection）：
+    - concat: 拼接中心细胞和上下文向量后投影（默认）
+    - add: 将上下文投影后与中心细胞相加
+    - film: Feature-wise Linear Modulation (γ * h + β)
+  - 输出：
+    - z_center: 条件化的中心细胞潜在表征
+    - z_context: 上下文向量的潜在表征
+    - z_all: 所有细胞的潜在表征
 
+```
+  from src.models.components.ae.set_scae import SetSCAE
+
+  # 使用 StackSetAE
+  model = SetSCAE(
+      strategy='stack',
+      n_input=28231,
+      n_latent=64,
+      set_size=16,
+      context_aggregation='attention',  # 'mean', 'attention', 'max'
+      condition_injection='concat',      # 'concat', 'add', 'film'
+      context_weight=1.0,
+  )
+
+  # 前向传播
+  outputs = model(x_set)  # x_set: (batch, set_size, n_genes)
+  z_center = outputs['z_center']  # (batch, n_latent)
+  z_context = outputs['z_context']  # (batch, n_latent)
+```
 ## RTF
 ### 2026-01-13
-不再使用`split_label`，训练的时候划分
+一致性不再使用`split_label`，训练的时候划分
 - `/fast/projects/scTFM/models/rtf/2026-01-15_10-07-57`
+
+
+### 2026-01-19
+实现了普通RTF的细胞天数筛选

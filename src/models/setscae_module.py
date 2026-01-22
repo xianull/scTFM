@@ -2,7 +2,7 @@
 SetSCAE Lightning Module
 
 用于训练 Set Single-Cell Autoencoder。
-支持三种策略：graph, contrastive, masked
+支持四种策略：graph, contrastive, masked, stack
 """
 
 from typing import Any, Dict, Literal, Optional
@@ -25,6 +25,7 @@ class SetSCAELitModule(LightningModule):
     - graph: GAT-based 图自编码器
     - contrastive: 对比学习自编码器
     - masked: 掩码自编码器
+    - stack: 基于Stack论文的条件嵌入方法
     """
 
     def __init__(
@@ -64,21 +65,23 @@ class SetSCAELitModule(LightningModule):
         """单步训练/验证"""
         # 获取数据 (兼容两种格式: x_set 或 x)
         x_set = batch.get("x_set", batch.get("x"))  # (batch, set_size, n_genes)
-        
+
         # 可选的额外输入
         adj = batch.get("adj", None)  # 邻接矩阵 (graph 策略)
         raw_counts = batch.get("raw_counts", batch.get("counts", None))  # 兼容 counts
         negatives = batch.get("negatives", None)  # 负样本 (contrastive 策略)
         library_size = batch.get("library_size", None)
-        
+        neighbor_mask = batch.get("neighbor_mask", None)  # 邻居掩码 (stack 策略)
+
         # 前向传播
         outputs = self.net(
             x_set,
             center_idx=self.center_idx,
             adj=adj,
             library_size=library_size,
+            neighbor_mask=neighbor_mask,
         )
-        
+
         # 计算损失
         losses = self.net.compute_loss(
             x_set,
@@ -88,7 +91,7 @@ class SetSCAELitModule(LightningModule):
             negatives=negatives,
             center_idx=self.center_idx,
         )
-        
+
         return losses
 
     def training_step(
@@ -98,10 +101,10 @@ class SetSCAELitModule(LightningModule):
     ) -> torch.Tensor:
         """训练步骤"""
         losses = self.model_step(batch, batch_idx)
-        
+
         # 记录损失
         self.log("train/loss", losses["loss"], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
-        
+
         if "recon_loss" in losses:
             self.log("train/recon_loss", losses["recon_loss"], on_step=False, on_epoch=True, sync_dist=True)
         if "contrastive_loss" in losses:
@@ -110,7 +113,7 @@ class SetSCAELitModule(LightningModule):
             self.log("train/link_loss", losses["link_loss"], on_step=False, on_epoch=True, sync_dist=True)
         if "mask_pred_loss" in losses:
             self.log("train/mask_pred_loss", losses["mask_pred_loss"], on_step=False, on_epoch=True, sync_dist=True)
-        
+
         return losses["loss"]
 
     def validation_step(
@@ -120,18 +123,18 @@ class SetSCAELitModule(LightningModule):
     ) -> torch.Tensor:
         """验证步骤"""
         losses = self.model_step(batch, batch_idx)
-        
+
         self.log("val/loss", losses["loss"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        
+
         if "recon_loss" in losses:
             self.log("val/recon_loss", losses["recon_loss"], on_step=False, on_epoch=True, sync_dist=True)
-        
+
         return losses["loss"]
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """配置优化器和调度器"""
         optimizer = self.hparams.optimizer(params=self.parameters())
-        
+
         if self.hparams.scheduler is not None:
             scheduler = self.hparams.scheduler(optimizer=optimizer)
             return {
@@ -143,7 +146,7 @@ class SetSCAELitModule(LightningModule):
                     "frequency": 1,
                 },
             }
-        
+
         return {"optimizer": optimizer}
 
     def get_latent(

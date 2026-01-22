@@ -1,9 +1,9 @@
 _target_: pytorch_lightning.Trainer
 default_root_dir: ${paths.output_dir}
 min_epochs: 1
-max_epochs: 10
+max_epochs: 15
 accelerator: gpu
-devices: [1,2,3,4,5,6,7] # 8 卡
+devices: [0,1,4,5] # 8 卡
 strategy: ddp # 多卡时改为 ddp
 precision: bf16-mixed # 混合精度
 gradient_clip_val: 1.0

@@ -3,13 +3,14 @@
 # Stage 1: SetSCAE Training (Set Single-Cell Autoencoder)
 #
 # 用于训练微环境感知的单细胞自编码器
-# 支持三种策略:
+# 支持四种策略:
 #   - graph: GAT-based 图自编码器
 #   - contrastive: 对比学习自编码器 (推荐)
 #   - masked: 掩码自编码器
+#   - stack: 基于Stack论文的条件嵌入方法
 #
 # 使用方法:
-#   # 同时跑三种策略 (multirun)
+#   # 同时跑四种策略 (multirun)
 #   python src/train.py experiment=stage1_setscae --multirun
 #
 #   # 单独跑一种策略
@@ -33,7 +34,7 @@ seed: 42
 # =============================================================================
 trainer:
   min_epochs: 2
-  max_epochs: 2
+  max_epochs: 10
   gradient_clip_val: 1.0
   precision: 16-mixed
 
@@ -52,14 +53,14 @@ model:
 
   # 网络配置
   net:
-    # 策略选择: 'graph', 'contrastive', 'masked'
+    # 策略选择: 'graph', 'contrastive', 'masked', 'stack'
     strategy: "contrastive"
 
     # 基础参数
     n_input: 28231
-    n_hidden: 256
-    n_latent: 64
-    n_layers: 2
+    n_hidden: 1024
+    n_latent: 256
+    n_layers: 4
     dropout_rate: 0.1
 
     # 集合大小
@@ -79,6 +80,12 @@ model:
     n_context_layers: 2
     mask_ratio: 0.3
     mask_strategy: "random"
+
+    # === Stack 策略参数 ===
+    context_aggregation: "attention"  # 'mean', 'attention', 'max'
+    condition_injection: "concat"     # 'concat', 'add', 'film'
+    context_weight: 1.0
+    n_context_heads: 4
 
 # =============================================================================
 # Data
@@ -113,10 +120,10 @@ logger:
     group: "setscae_stage1"
 
 # =============================================================================
-# Hydra Multirun - 同时跑三种策略
+# Hydra Multirun - 同时跑四种策略
 # =============================================================================
 hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      model.net.strategy: graph,contrastive,masked
+      model.net.strategy: graph,contrastive,masked,stack

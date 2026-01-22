@@ -35,6 +35,9 @@ io_chunk_size: 16384
 split_label_train: 0  # Train (ID)
 split_label_val: 1    # Val (ID)
 
+# 最大时间筛选（天）- 只保留该时间内的细胞，null 表示不限制
+max_time_days: null
+
 # Latent Key (根据 model.mode 自动调整)
 # - latent mode: "X_latent"
 # - raw mode: null

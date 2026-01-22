@@ -2,10 +2,11 @@
 Set Single-Cell Autoencoder (SetSCAE)
 
 用于建模细胞微环境的自编码器框架。
-支持三种策略：
+支持四种策略：
 1. GraphSetAE - 基于GAT的图自编码器
 2. ContrastiveSetAE - 对比学习自编码器
 3. MaskedSetAE - 掩码自编码器
+4. StackSetAE - 基于Stack论文的条件嵌入方法
 
 核心思想：
 - 输入是一个细胞集合（中心细胞 + 邻居细胞）
@@ -16,6 +17,7 @@ Set Single-Cell Autoencoder (SetSCAE)
 - scVI: https://docs.scvi-tools.org
 - Set Transformer: https://arxiv.org/abs/1810.00825
 - GAT: https://arxiv.org/abs/1710.10903
+- Stack: Spatial Transcriptomics Analysis via Conditional Knowledge distillation
 """
 
 import torch
@@ -156,7 +158,12 @@ class BaseSetSCAE(nn.Module, ABC):
     """
     SetSCAE 基础类
 
-    定义通用接口和共享组件
+    定义通用接口和共享组件。
+
+    重要设计决策：
+    - 基类只包含真正共享的组件（decoder、NB参数）
+    - encoder 由各子类自己定义，避免 DDP 未使用参数问题
+    - 子类需要实现 _build_encoder() 方法
     """
 
     def __init__(
@@ -178,23 +185,16 @@ class BaseSetSCAE(nn.Module, ABC):
         self.n_input = n_input
         self.n_hidden = n_hidden
         self.n_latent = n_latent
+        self.n_layers = n_layers
+        self.dropout_rate = dropout_rate
+        self.activation = activation
+        self.use_residual = use_residual
         self.dispersion = dispersion
         self.gene_likelihood = gene_likelihood
         self.set_size = set_size
 
-        # 单细胞编码器 (共享)
-        self.cell_encoder = Encoder(
-            n_input=n_input,
-            n_hidden=n_hidden,
-            n_latent=n_latent,
-            n_layers=n_layers,
-            dropout_rate=dropout_rate,
-            activation=activation,
-            use_residual=use_residual,
-        )
-
-        # 潜在空间投影
-        self.z_mean = nn.Linear(n_hidden, n_latent)
+        # 注意：encoder 由子类在 _build_encoder() 中定义
+        # 这样可以避免 DDP 未使用参数问题
 
         # 单细胞解码器 (共享)
         self.cell_decoder = Decoder(
@@ -217,21 +217,26 @@ class BaseSetSCAE(nn.Module, ABC):
                 nn.Softplus(),
             )
 
-        self._init_weights()
-
     def _init_weights(self):
-        """初始化权重"""
+        """初始化权重 - 子类应在构建完成后调用"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight, gain=0.6)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def encode_cell(self, x: torch.Tensor) -> torch.Tensor:
-        """编码单个细胞"""
-        h = self.cell_encoder(x)
-        z = self.z_mean(h)
-        return z
+    @abstractmethod
+    def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        编码方法 - 由子类实现
+
+        Args:
+            x: 输入数据
+
+        Returns:
+            z: 潜在表征
+        """
+        pass
 
     def decode_cell(
         self,
@@ -397,6 +402,8 @@ class GraphSetAE(BaseSetSCAE):
 
     通过图注意力网络在编码阶段引入微环境信息。
     双重解码器：特征重建 + 链路预测
+
+    编码器架构：input_proj + GAT layers
     """
 
     def __init__(
@@ -455,12 +462,40 @@ class GraphSetAE(BaseSetSCAE):
             self.gat_layers.append(nn.LayerNorm(n_hidden))
             self.gat_layers.append(nn.GELU())
 
-        # 潜在空间投影 (覆盖基类)
+        # 潜在空间投影
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
-        # 冻结未使用的 cell_encoder (GraphSetAE 使用 input_proj + GAT 替代)
-        for param in self.cell_encoder.parameters():
-            param.requires_grad = False
+        self._init_weights()
+
+    def encode(
+        self,
+        x_set: torch.Tensor,
+        adj: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        GAT 编码
+
+        Args:
+            x_set: (batch, set_size, n_genes)
+            adj: (batch, set_size, set_size) 邻接矩阵
+
+        Returns:
+            z_all: (batch, set_size, n_latent)
+        """
+        # 输入投影
+        h = self.input_proj(x_set)  # (batch, set_size, n_hidden)
+
+        # GAT 编码
+        for layer in self.gat_layers:
+            if isinstance(layer, GraphAttentionLayer):
+                h = layer(h, adj)
+            else:
+                h = layer(h)
+
+        # 获取潜在表征
+        z_all = self.z_mean(h)  # (batch, set_size, n_latent)
+        return z_all
 
     def forward(
         self,
@@ -483,18 +518,8 @@ class GraphSetAE(BaseSetSCAE):
         if library_size is None:
             library_size = torch.expm1(x_set).sum(dim=-1).clamp(min=1.0)
 
-        # 输入投影
-        h = self.input_proj(x_set)  # (batch, set_size, n_hidden)
-
         # GAT 编码
-        for layer in self.gat_layers:
-            if isinstance(layer, GraphAttentionLayer):
-                h = layer(h, adj)
-            else:
-                h = layer(h)
-
-        # 获取潜在表征
-        z_all = self.z_mean(h)  # (batch, set_size, n_latent)
+        z_all = self.encode(x_set, adj=adj)  # (batch, set_size, n_latent)
         z_center = z_all[:, center_idx, :]  # (batch, n_latent)
 
         # 解码所有细胞 (不仅仅是中心细胞)
@@ -575,6 +600,8 @@ class ContrastiveSetAE(BaseSetSCAE):
     通过 InfoNCE 损失强制 Latent 空间在局部邻域内保持平滑。
     正样本：空间邻居细胞
     负样本：随机采样的非邻居细胞
+
+    编码器架构：标准 scVI-style Encoder
     """
 
     def __init__(
@@ -612,12 +639,49 @@ class ContrastiveSetAE(BaseSetSCAE):
         self.temperature = temperature
         self.n_negatives = n_negatives
 
+        # 单细胞编码器 (ContrastiveSetAE 使用标准 scVI-style encoder)
+        self.cell_encoder = Encoder(
+            n_input=n_input,
+            n_hidden=n_hidden,
+            n_latent=n_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            activation=activation,
+            use_residual=use_residual,
+        )
+
+        # 潜在空间投影
+        self.z_mean = nn.Linear(n_hidden, n_latent)
+
         # 投影头 (用于对比学习)
         self.projection_head = nn.Sequential(
             nn.Linear(n_latent, n_hidden),
             nn.GELU(),
             nn.Linear(n_hidden, n_latent),
         )
+
+        self._init_weights()
+
+    def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        """
+        编码单个细胞
+
+        Args:
+            x: (batch, n_genes) 或 (batch, set_size, n_genes)
+
+        Returns:
+            z: 潜在表征
+        """
+        # 处理 3D 输入
+        if x.dim() == 3:
+            batch_size, set_size, n_genes = x.shape
+            x_flat = x.view(-1, n_genes)
+            h_flat = self.cell_encoder(x_flat)
+            z_flat = self.z_mean(h_flat)
+            return z_flat.view(batch_size, set_size, -1)
+        else:
+            h = self.cell_encoder(x)
+            return self.z_mean(h)
 
     def forward(
         self,
@@ -638,7 +702,7 @@ class ContrastiveSetAE(BaseSetSCAE):
         if library_size is None:
             library_size = torch.expm1(x_set).sum(dim=-1).clamp(min=1.0)
 
-        # 编码所有细胞 (共享encoder)
+        # 编码所有细胞
         x_flat = x_set.view(-1, n_genes)
         h_flat = self.cell_encoder(x_flat)
         z_flat = self.z_mean(h_flat)
@@ -787,6 +851,8 @@ class MaskedSetAE(BaseSetSCAE):
     - 输入：中心细胞 + 邻居细胞
     - 掩码：随机遮盖中心细胞的部分基因
     - 预测：利用邻居信息预测被遮盖的基因
+
+    编码器架构：input_proj + Transformer context_encoder
     """
 
     def __init__(
@@ -863,9 +929,48 @@ class MaskedSetAE(BaseSetSCAE):
         # 潜在空间投影
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
-        # 冻结未使用的 cell_encoder (MaskedSetAE 使用 input_proj + context_encoder 替代)
-        for param in self.cell_encoder.parameters():
-            param.requires_grad = False
+        self._init_weights()
+
+    def encode(
+        self,
+        x_set: torch.Tensor,
+        center_idx: int = 0,
+        gene_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        上下文感知编码
+
+        Args:
+            x_set: (batch, set_size, n_genes)
+            center_idx: 中心细胞索引
+            gene_mask: (batch, n_genes) 基因掩码
+
+        Returns:
+            z_all: (batch, set_size, n_latent)
+        """
+        batch_size, set_size, n_genes = x_set.shape
+
+        # 投影所有细胞
+        h_set = self.input_proj(x_set)  # (batch, set_size, n_hidden)
+
+        # 如果有掩码，对中心细胞应用掩码
+        if gene_mask is not None:
+            h_center = h_set[:, center_idx, :].clone()
+            mask_ratio = gene_mask.float().mean(dim=-1, keepdim=True)
+            h_center_masked = h_center * (1 - mask_ratio) + self.mask_token.squeeze(1) * mask_ratio
+            h_set = h_set.clone()
+            h_set[:, center_idx, :] = h_center_masked
+
+        # 添加位置编码
+        h_set = self.pos_encoding(h_set, center_idx)
+
+        # 上下文编码
+        h_context = self.context_encoder(h_set)
+
+        # 获取潜在表征
+        z_all = self.z_mean(h_context)
+        return z_all
 
     def create_mask(
         self,
@@ -1037,6 +1142,384 @@ class MaskedSetAE(BaseSetSCAE):
 
 
 # =============================================================================
+# 方案四: StackSetAE - 基于Stack论文的条件嵌入方法
+# =============================================================================
+
+class StackSetAE(BaseSetSCAE):
+    """
+    方案四: 基于Stack论文的条件嵌入自编码器
+
+    核心思想（参考 Stack 论文）：
+    - 使用条件嵌入 (condition embedding) 来编码微环境信息
+    - 通过 concatenation 或 addition 将条件信息注入 latent space
+    - 简单、统一、无需为不同条件设计不同架构
+
+    工作流程：
+    1. 对邻居细胞进行聚合，得到微环境上下文向量
+    2. 将上下文向量作为条件信息注入到中心细胞的编码过程
+    3. 条件注入方式：concat, add, 或 film (Feature-wise Linear Modulation)
+
+    优势：
+    - 架构简单，易于理解和调试
+    - 与标准 scVI 编码器兼容
+    - 灵活的条件注入方式
+    """
+
+    def __init__(
+        self,
+        n_input: int = 28231,
+        n_hidden: int = 256,
+        n_latent: int = 64,
+        n_layers: int = 2,
+        dropout_rate: float = 0.1,
+        activation: str = "GELU",
+        use_residual: bool = True,
+        dispersion: Literal['gene', 'gene-cell'] = 'gene',
+        gene_likelihood: Literal['nb', 'zinb'] = 'nb',
+        set_size: int = 16,
+        # Stack 特有参数
+        context_aggregation: Literal['mean', 'attention', 'max'] = 'attention',
+        condition_injection: Literal['concat', 'add', 'film'] = 'concat',
+        context_weight: float = 1.0,
+        n_context_heads: int = 4,
+        **kwargs
+    ):
+        super().__init__(
+            n_input=n_input,
+            n_hidden=n_hidden,
+            n_latent=n_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            activation=activation,
+            use_residual=use_residual,
+            dispersion=dispersion,
+            gene_likelihood=gene_likelihood,
+            set_size=set_size,
+            **kwargs
+        )
+
+        self.context_aggregation = context_aggregation
+        self.condition_injection = condition_injection
+        self.context_weight = context_weight
+
+        # 单细胞编码器 (用于编码所有细胞)
+        self.cell_encoder = Encoder(
+            n_input=n_input,
+            n_hidden=n_hidden,
+            n_latent=n_latent,
+            n_layers=n_layers,
+            dropout_rate=dropout_rate,
+            activation=activation,
+            use_residual=use_residual,
+        )
+
+        # 上下文聚合模块
+        if context_aggregation == 'attention':
+            # 使用注意力机制聚合邻居信息
+            self.context_query = nn.Linear(n_hidden, n_hidden)
+            self.context_key = nn.Linear(n_hidden, n_hidden)
+            self.context_value = nn.Linear(n_hidden, n_hidden)
+            self.context_heads = n_context_heads
+            self.context_head_dim = n_hidden // n_context_heads
+            self.context_out = nn.Linear(n_hidden, n_hidden)
+
+        # 条件注入模块
+        if condition_injection == 'concat':
+            # 拼接后投影
+            self.z_mean = nn.Linear(n_hidden * 2, n_latent)
+        elif condition_injection == 'add':
+            # 直接相加
+            self.z_mean = nn.Linear(n_hidden, n_latent)
+            self.context_proj = nn.Linear(n_hidden, n_hidden)
+        elif condition_injection == 'film':
+            # Feature-wise Linear Modulation
+            self.z_mean = nn.Linear(n_hidden, n_latent)
+            self.film_gamma = nn.Linear(n_hidden, n_hidden)
+            self.film_beta = nn.Linear(n_hidden, n_hidden)
+
+        self._init_weights()
+
+    def aggregate_context(
+        self,
+        h_center: torch.Tensor,
+        h_neighbors: torch.Tensor,
+        neighbor_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        聚合邻居细胞的上下文信息
+
+        Args:
+            h_center: (batch, n_hidden) - 中心细胞的隐藏表征
+            h_neighbors: (batch, n_neighbors, n_hidden) - 邻居细胞的隐藏表征
+            neighbor_mask: (batch, n_neighbors) - 邻居掩码，True表示有效
+
+        Returns:
+            context: (batch, n_hidden) - 聚合后的上下文向量
+        """
+        batch_size, n_neighbors, n_hidden = h_neighbors.shape
+
+        if self.context_aggregation == 'mean':
+            if neighbor_mask is not None:
+                # 带掩码的平均
+                mask = neighbor_mask.unsqueeze(-1).float()
+                context = (h_neighbors * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            else:
+                context = h_neighbors.mean(dim=1)
+
+        elif self.context_aggregation == 'max':
+            if neighbor_mask is not None:
+                # 带掩码的最大池化
+                h_neighbors = h_neighbors.masked_fill(
+                    ~neighbor_mask.unsqueeze(-1), float('-inf')
+                )
+            context = h_neighbors.max(dim=1)[0]
+
+        elif self.context_aggregation == 'attention':
+            # 多头注意力聚合
+            # Query: 中心细胞, Key/Value: 邻居细胞
+            Q = self.context_query(h_center)  # (batch, n_hidden)
+            K = self.context_key(h_neighbors)  # (batch, n_neighbors, n_hidden)
+            V = self.context_value(h_neighbors)  # (batch, n_neighbors, n_hidden)
+
+            # 重塑为多头
+            Q = Q.view(batch_size, 1, self.context_heads, self.context_head_dim)
+            K = K.view(batch_size, n_neighbors, self.context_heads, self.context_head_dim)
+            V = V.view(batch_size, n_neighbors, self.context_heads, self.context_head_dim)
+
+            # (batch, heads, 1, head_dim) @ (batch, heads, head_dim, n_neighbors)
+            Q = Q.permute(0, 2, 1, 3)  # (batch, heads, 1, head_dim)
+            K = K.permute(0, 2, 3, 1)  # (batch, heads, head_dim, n_neighbors)
+            V = V.permute(0, 2, 1, 3)  # (batch, heads, n_neighbors, head_dim)
+
+            # 注意力分数
+            attn = torch.matmul(Q, K) / math.sqrt(self.context_head_dim)
+            # (batch, heads, 1, n_neighbors)
+
+            if neighbor_mask is not None:
+                # 应用掩码
+                mask = neighbor_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_neighbors)
+                attn = attn.masked_fill(~mask, float('-inf'))
+
+            attn = F.softmax(attn, dim=-1)
+
+            # 聚合
+            context = torch.matmul(attn, V)  # (batch, heads, 1, head_dim)
+            context = context.permute(0, 2, 1, 3).reshape(batch_size, n_hidden)
+            context = self.context_out(context)
+
+        return context
+
+    def inject_condition(
+        self,
+        h_center: torch.Tensor,
+        context: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        将上下文条件注入到中心细胞表征
+
+        Args:
+            h_center: (batch, n_hidden) - 中心细胞的隐藏表征
+            context: (batch, n_hidden) - 上下文向量
+
+        Returns:
+            z: (batch, n_latent)
+        """
+        context = context * self.context_weight
+
+        if self.condition_injection == 'concat':
+            # 拼接
+            h_combined = torch.cat([h_center, context], dim=-1)
+            z = self.z_mean(h_combined)
+
+        elif self.condition_injection == 'add':
+            # 相加
+            context_proj = self.context_proj(context)
+            h_combined = h_center + context_proj
+            z = self.z_mean(h_combined)
+
+        elif self.condition_injection == 'film':
+            # Feature-wise Linear Modulation: gamma * h + beta
+            gamma = self.film_gamma(context)
+            beta = self.film_beta(context)
+            h_modulated = gamma * h_center + beta
+            z = self.z_mean(h_modulated)
+
+        return z
+
+    def _encode_all_cells(
+        self,
+        x_set: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        编码所有细胞到隐藏空间
+
+        Args:
+            x_set: (batch, set_size, n_genes)
+
+        Returns:
+            h_all: (batch, set_size, n_hidden)
+        """
+        batch_size, set_size, n_genes = x_set.shape
+        x_flat = x_set.view(-1, n_genes)
+        h_flat = self.cell_encoder(x_flat)
+        h_all = h_flat.view(batch_size, set_size, -1)
+        return h_all
+
+    def _compute_context(
+        self,
+        h_all: torch.Tensor,
+        center_idx: int = 0,
+        neighbor_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算上下文向量
+
+        Args:
+            h_all: (batch, set_size, n_hidden)
+            center_idx: 中心细胞索引
+            neighbor_mask: (batch, set_size) 邻居掩码
+
+        Returns:
+            h_center: (batch, n_hidden)
+            context: (batch, n_hidden)
+        """
+        batch_size, set_size, _ = h_all.shape
+
+        # 分离中心细胞和邻居
+        h_center = h_all[:, center_idx, :]  # (batch, n_hidden)
+
+        # 获取邻居（排除中心细胞）
+        neighbor_indices = [i for i in range(set_size) if i != center_idx]
+        h_neighbors = h_all[:, neighbor_indices, :]  # (batch, n_neighbors, n_hidden)
+
+        # 处理邻居掩码
+        if neighbor_mask is not None:
+            neighbor_mask_filtered = neighbor_mask[:, neighbor_indices]
+        else:
+            neighbor_mask_filtered = None
+
+        # 聚合上下文
+        context = self.aggregate_context(h_center, h_neighbors, neighbor_mask_filtered)
+
+        return h_center, context
+
+    def encode(
+        self,
+        x_set: torch.Tensor,
+        center_idx: int = 0,
+        neighbor_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        编码细胞集合
+
+        Args:
+            x_set: (batch, set_size, n_genes)
+            center_idx: 中心细胞索引
+            neighbor_mask: (batch, set_size) 邻居掩码
+
+        Returns:
+            z_center: (batch, n_latent) - 条件化的中心细胞潜在表征
+            context: (batch, n_hidden) - 上下文向量
+        """
+        # 编码所有细胞
+        h_all = self._encode_all_cells(x_set)
+
+        # 计算上下文
+        h_center, context = self._compute_context(h_all, center_idx, neighbor_mask)
+
+        # 条件注入得到 z
+        z_center = self.inject_condition(h_center, context)
+
+        return z_center, context
+
+    def forward(
+        self,
+        x_set: torch.Tensor,
+        library_size: Optional[torch.Tensor] = None,
+        center_idx: int = 0,
+        neighbor_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            x_set: (batch, set_size, n_genes)
+            library_size: (batch, set_size)
+            center_idx: 中心细胞索引
+            neighbor_mask: (batch, set_size) 邻居掩码
+        """
+        batch_size, set_size, n_genes = x_set.shape
+
+        # 估算 library size
+        if library_size is None:
+            library_size = torch.expm1(x_set).sum(dim=-1).clamp(min=1.0)
+
+        # 编码所有细胞（只调用一次 cell_encoder）
+        h_all = self._encode_all_cells(x_set)
+
+        # 计算上下文
+        h_center, context = self._compute_context(h_all, center_idx, neighbor_mask)
+
+        # 为所有细胞生成 z（使用相同的上下文）
+        z_all_list = []
+        for i in range(set_size):
+            z_i = self.inject_condition(h_all[:, i, :], context)
+            z_all_list.append(z_i.unsqueeze(1))
+        z_all = torch.cat(z_all_list, dim=1)  # (batch, set_size, n_latent)
+
+        z_center = z_all[:, center_idx, :]
+
+        # 解码所有细胞
+        z_flat = z_all.view(-1, z_all.size(-1))
+        lib_flat = library_size.view(-1)
+        decoded = self.decode_cell(z_flat, lib_flat)
+
+        # reshape 回 (batch, set_size, n_genes)
+        mu_all = decoded['mu'].view(batch_size, set_size, -1)
+        theta_all = decoded['theta'].view(batch_size, set_size, -1)
+
+        outputs = {
+            'z_all': z_all,
+            'z_center': z_center,
+            'context': context,
+            'mu_all': mu_all,
+            'theta_all': theta_all,
+            'mu': mu_all[:, center_idx, :],
+            'theta': theta_all[:, center_idx, :],
+        }
+
+        return outputs
+
+    def compute_loss(
+        self,
+        x_set: torch.Tensor,
+        outputs: Dict[str, torch.Tensor],
+        raw_counts: Optional[torch.Tensor] = None,
+        center_idx: int = 0,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """计算损失"""
+        from .losses import log_nb_positive
+
+        # 重建损失 (所有细胞)
+        if raw_counts is not None:
+            target = raw_counts
+        else:
+            target = torch.expm1(x_set)
+
+        mu_all = outputs['mu_all']
+        theta_all = outputs['theta_all']
+
+        log_prob = log_nb_positive(target, mu_all, theta_all)
+        recon_loss = -log_prob.mean()
+
+        return {
+            'loss': recon_loss,
+            'recon_loss': recon_loss,
+        }
+
+
+# =============================================================================
 # 统一接口: SetSCAE
 # =============================================================================
 
@@ -1048,17 +1531,19 @@ class SetSCAE(nn.Module):
     - 'graph': GraphSetAE (GAT-based)
     - 'contrastive': ContrastiveSetAE
     - 'masked': MaskedSetAE
+    - 'stack': StackSetAE (条件嵌入方法)
     """
 
     STRATEGIES = {
         'graph': GraphSetAE,
         'contrastive': ContrastiveSetAE,
         'masked': MaskedSetAE,
+        'stack': StackSetAE,
     }
 
     def __init__(
         self,
-        strategy: Literal['graph', 'contrastive', 'masked'] = 'contrastive',
+        strategy: Literal['graph', 'contrastive', 'masked', 'stack'] = 'contrastive',
         **kwargs
     ):
         super().__init__()
@@ -1081,8 +1566,8 @@ class SetSCAE(nn.Module):
     def get_latent(self, *args, **kwargs):
         return self.model.get_latent(*args, **kwargs)
 
-    def encode_cell(self, *args, **kwargs):
-        return self.model.encode_cell(*args, **kwargs)
+    def encode(self, *args, **kwargs):
+        return self.model.encode(*args, **kwargs)
 
     def decode_cell(self, *args, **kwargs):
         return self.model.decode_cell(*args, **kwargs)

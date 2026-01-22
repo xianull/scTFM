@@ -14,7 +14,7 @@ defaults:
   - override /callbacks: default
   - override /logger: wandb
 
-task_name: "rtf_stage2_cfg"
+task_name: "rtf_stage2_cfg_day100"
 
 tags: ["rtf", "flow", "cross_attn", "cfg", "stage2"]
 
@@ -31,14 +31,14 @@ trainer:
 
   # GPU Mn
   accelerator: gpu
-  devices: [0,1,2,3,4,5,6,7]
+  devices: [2,3,6,7]
   strategy: ddp
 
 # =============================================================================
 # Model Mn
 # =============================================================================
 model:
-  mode: latent
+  mode: raw
   flow_type: rectified_flow
 
   ae_ckpt_path: null  
@@ -47,17 +47,13 @@ model:
     lr: 1e-4
     weight_decay: 1e-5
 
-  scheduler:
-    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
-    _partial_: true
-    T_max: 200
-    eta_min: 1e-6
-
+  # scheduler 使用基础配置 flow_stage2_cfg.yaml 中的 ReduceLROnPlateau
 
   net:
-    hidden_size: 768      
-    depth: 16             
-    num_heads: 12         
+    input_dim: 28231      # raw 模式下的基因维度
+    hidden_size: 768
+    depth: 16
+    num_heads: 12
     mlp_ratio: 4.0
     dropout: 0.0
     cond_dropout: 0.15    
@@ -69,6 +65,7 @@ model:
 data:
   batch_size: 256
   num_workers: 8
+  max_time_days: 100.0  # 限制细胞最大天数
 
 # =============================================================================
 # Callbacks Mn

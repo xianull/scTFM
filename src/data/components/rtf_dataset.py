@@ -188,6 +188,7 @@ class SomaRTFDataset(IterableDataset):
         shard_assignment: Optional[Dict[str, List[str]]] = None,
         stage_info_path: Optional[str] = None,
         use_log_time: bool = True,
+        max_time_days: Optional[float] = None,  # 最大时间筛选（天），None 表示不限制
     ):
         self.root_dir = root_dir
         self.split_label = split_label
@@ -199,6 +200,7 @@ class SomaRTFDataset(IterableDataset):
         self._n_vars = None
         self.shard_assignment = shard_assignment
         self.use_log_time = use_log_time
+        self.max_time_days = max_time_days
 
         self.stage_map = get_stage_map(stage_info_path)
 
@@ -361,6 +363,12 @@ class SomaRTFDataset(IterableDataset):
 
             # 4. 筛选当前 split 的细胞（向量化）
             curr_mask = split_labels == self.split_label
+
+            # 如果设置了 max_time_days，进一步筛选时间范围内的细胞
+            if self.max_time_days is not None:
+                time_mask = times <= self.max_time_days
+                curr_mask = curr_mask & time_mask
+
             curr_indices = np.where(curr_mask)[0]
 
             if len(curr_indices) == 0:
@@ -377,8 +385,12 @@ class SomaRTFDataset(IterableDataset):
                     if next_id is not None and not pd.isna(next_id):
                         next_id_str = str(next_id)
                         if next_id_str in cell_to_idx:
+                            next_idx = cell_to_idx[next_id_str]
+                            # 检查 next 细胞的时间是否在范围内
+                            if self.max_time_days is not None and times[next_idx] > self.max_time_days:
+                                continue
                             pairs_curr_idx.append(i)
-                            pairs_next_idx.append(cell_to_idx[next_id_str])
+                            pairs_next_idx.append(next_idx)
 
             if self.direction in ("backward", "both") and "prev_cell_id" in obs_df.columns:
                 prev_cell_ids = obs_df["prev_cell_id"].values
@@ -387,8 +399,12 @@ class SomaRTFDataset(IterableDataset):
                     if prev_id is not None and not pd.isna(prev_id):
                         prev_id_str = str(prev_id)
                         if prev_id_str in cell_to_idx:
+                            prev_idx = cell_to_idx[prev_id_str]
+                            # 检查 prev 细胞的时间是否在范围内
+                            if self.max_time_days is not None and times[prev_idx] > self.max_time_days:
+                                continue
                             # backward: prev -> curr
-                            pairs_curr_idx.append(cell_to_idx[prev_id_str])
+                            pairs_curr_idx.append(prev_idx)
                             pairs_next_idx.append(i)
 
             if len(pairs_curr_idx) == 0:
