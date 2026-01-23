@@ -1,34 +1,136 @@
 - 数据路径： `/fast/data/scTFM`
 - 模型路径：`/fast/projects/scTFM`
 
-## 自编码器（setAE）
+## 自编码器（SetSCAE）
+
+支持四种微环境建模策略的单细胞自编码器框架。
+
 ```plaintext
   SetSCAE (统一接口)
-      ├── GraphSetAE      (GAT + 链路预测)
+      ├── GraphSetAE       (GAT + 链路预测)
       ├── ContrastiveSetAE (对比学习)
-      └── MaskedSetAE     (掩码预测)
+      ├── MaskedSetAE      (掩码预测)
+      └── StackSetAE       (条件嵌入) ← 新增
 ```
-### 方案
-|              | GraphSetAE              | ContrastiveSetAE    | MaskedSetAE                                  |
-|--------------|-------------------------|---------------------|----------------------------------------------|
-| 编码器          | input_proj + GAT layers | cell_encoder (scVI) | input_proj + Transformer                     |
-| 编码方式         | 图注意力聚合邻居信息              | 独立编码每个细胞            | 掩码中心 + 上下文编码                                 |
-| 特有模块         | gat_layers              | projection_head     | mask_token, context_encoder, prediction_head |
-| cell_encoder | 冻结 (不使用)                | 使用                  | 冻结 (不使用)                                     |
-| 特有损失         | 链路预测 (adj_pred)         | InfoNCE 对比损失        | 掩码基因预测 (MSE)                                 |
+
+### 方案对比
+
+|              | GraphSetAE              | ContrastiveSetAE    | MaskedSetAE                                  | StackSetAE                          |
+|--------------|-------------------------|---------------------|----------------------------------------------|-------------------------------------|
+| 编码器       | input_proj + GAT layers | cell_encoder (scVI) | input_proj + Transformer                     | cell_encoder + 条件注入              |
+| 编码方式     | 图注意力聚合邻居信息     | 独立编码每个细胞     | 掩码中心 + 上下文编码                         | 邻居聚合 → 条件注入                  |
+| 特有模块     | gat_layers              | projection_head     | mask_token, context_encoder, prediction_head | context attention, injection layer  |
+| 特有损失     | 链路预测 (BCE)          | InfoNCE 对比损失     | 掩码基因预测 (MSE)                            | 无（仅重建损失）                     |
+| 复杂度       | 高                      | 中                  | 高                                           | 低                                  |
+
 ### Loss
-所有策略共享：NB 重建损失 (所有细胞)
+
+**所有策略共享**：NB 重建损失 (所有细胞)
+```python
 recon_loss = -log_nb_positive(target, mu_all, theta_all).mean()
-策略特定损失：
+```
+
+**策略特定损失**：
 
 | 策略          | 特定损失    | 公式                             |
 |-------------|---------|--------------------------------|
 | Graph       | 链路预测    | BCE(adj_pred, adj)             |
 | Contrastive | InfoNCE | CrossEntropy(pos_sim, neg_sim) |
 | Masked      | 掩码预测    | MSE(pred_genes[mask], x[mask]) |
+| Stack       | 无       | 仅使用重建损失                    |
 
-### 2026-01-14
+### StackSetAE 详解
 
+基于 [Stack](https://www.nature.com/articles/s41592-024-02361-5) 论文的条件嵌入方法，核心思想是通过简单的条件注入机制将微环境信息融入细胞表征。
+
+**工作流程**：
+```
+x_set (batch, set_size, n_genes)
+    │
+    ▼
+┌─────────────────────────────────┐
+│  cell_encoder (共享)             │  编码所有细胞
+│  h_all = encoder(x_set)         │  → (batch, set_size, n_hidden)
+└─────────────────────────────────┘
+    │
+    ├──► h_center = h_all[:, 0, :]     中心细胞
+    │
+    └──► h_neighbors = h_all[:, 1:, :] 邻居细胞
+              │
+              ▼
+        ┌─────────────────────┐
+        │  Context Aggregation │  聚合邻居信息
+        │  (mean/attention/max)│
+        └─────────────────────┘
+              │
+              ▼
+          context (batch, n_hidden)
+              │
+              ▼
+        ┌─────────────────────┐
+        │  Condition Injection │  注入条件
+        │  (concat/add/film)   │
+        └─────────────────────┘
+              │
+              ▼
+          z_center (batch, n_latent)  条件化的潜在表征
+```
+
+**配置选项**：
+
+| 参数                  | 选项                        | 说明                                |
+|----------------------|----------------------------|-------------------------------------|
+| `context_aggregation`| `mean`, `attention`, `max` | 邻居信息聚合方式                     |
+| `condition_injection`| `concat`, `add`, `film`    | 条件信息注入方式                     |
+| `context_weight`     | float (默认 1.0)            | 上下文权重                           |
+| `n_context_heads`    | int (默认 4)                | attention 聚合的头数                 |
+
+**条件注入方式**：
+- `concat`: `z = Linear([h_center; context])` - 拼接后投影
+- `add`: `z = Linear(h_center + proj(context))` - 残差相加
+- `film`: `z = Linear(γ(context) * h_center + β(context))` - Feature-wise Linear Modulation
+
+**优势**：
+1. 架构简单，计算效率高
+2. 无额外损失函数，训练稳定
+3. 灵活的配置组合（3×3=9种）
+4. 与 scVI encoder 完全兼容
+
+**使用示例**：
+```python
+from src.models.components.ae.set_scae import SetSCAE
+
+model = SetSCAE(
+    strategy='stack',
+    n_input=28231,
+    n_hidden=256,
+    n_latent=64,
+    n_layers=2,
+    set_size=16,
+    context_aggregation='attention',
+    condition_injection='concat',
+    context_weight=1.0,
+)
+
+outputs = model(x_set)  # x_set: (batch, set_size, n_genes)
+z_center = outputs['z_center']  # (batch, n_latent) - 条件化表征
+z_all = outputs['z_all']        # (batch, set_size, n_latent)
+```
+
+### 训练命令
+
+```bash
+# 同时跑四种策略 (multirun)
+python src/train.py experiment=stage1_setscae --multirun
+
+# 单独跑某种策略
+python src/train.py experiment=stage1_setscae hydra.mode=RUN model.net.strategy=stack
+python src/train.py experiment=stage1_setscae hydra.mode=RUN model.net.strategy=contrastive
+```
+
+### 更新日志
+
+#### 2026-01-14
 - /fast/projects/scTFM/models/ae/2026-01-16_04-13-53
   - z_all 包含所有细胞的 latent (batch, set_size, n_latent)
   - 但 decode_cell 只解码中心细胞
@@ -42,45 +144,16 @@ recon_loss = -log_nb_positive(target, mu_all, theta_all).mean()
 - 每个 forward pass 中，轮流让 bag 中的每个细胞作为中心，计算所有细胞的重建损失。
     - 折中方案，如果每个细胞再随机采的话太慢了
 
-### 2026-01-18
-模型路径：`/fast/projects/scTFM/models/ae/setaev0_2`
-- GraphSetAE 和 MaskedSetAE 继承自 BaseSetSCAE，基类创建了cell_encoder，但这两个策略没有使用它，导致 DDP 检测到未使用的参数。
-- 基于 Stack 论文的条件嵌入方法
-  - 上下文聚合（context_aggregation）：
-    - mean: 简单平均邻居表征
-    - attention: 多头注意力聚合（默认）
-    - max: 最大池化
-  - 条件注入（condition_injection）：
-    - concat: 拼接中心细胞和上下文向量后投影（默认）
-    - add: 将上下文投影后与中心细胞相加
-    - film: Feature-wise Linear Modulation (γ * h + β)
-  - 输出：
-    - z_center: 条件化的中心细胞潜在表征
-    - z_context: 上下文向量的潜在表征
-    - z_all: 所有细胞的潜在表征
+#### 2026-01-18
+- 修复 DDP 未使用参数问题
+  - 重构 BaseSetSCAE，移除基类中的 cell_encoder
+  - 各子类自行定义编码器，避免参数冗余
+- 新增 StackSetAE 策略（基于 Stack 论文的条件嵌入方法）
 
-```
-  from src.models.components.ae.set_scae import SetSCAE
-
-  # 使用 StackSetAE
-  model = SetSCAE(
-      strategy='stack',
-      n_input=28231,
-      n_latent=64,
-      set_size=16,
-      context_aggregation='attention',  # 'mean', 'attention', 'max'
-      condition_injection='concat',      # 'concat', 'add', 'film'
-      context_weight=1.0,
-  )
-
-  # 前向传播
-  outputs = model(x_set)  # x_set: (batch, set_size, n_genes)
-  z_center = outputs['z_center']  # (batch, n_latent)
-  z_context = outputs['z_context']  # (batch, n_latent)
-```
 ## RTF
 ### 2026-01-13
-一致性不再使用`split_label`，训练的时候划分
+一致性不再使用`split_label`，训练的时候划分。
+直接把数据集的细胞按链匹配
 - `/fast/projects/scTFM/models/rtf/2026-01-15_10-07-57`
 
 

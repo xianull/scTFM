@@ -25,14 +25,14 @@ seed: 42
 # =============================================================================
 trainer:
   min_epochs: 10
-  max_epochs: 200
+  max_epochs: 10
   gradient_clip_val: 1.0
   precision: 16-mixed
 
   # GPU Mn
   accelerator: gpu
-  devices: [2,3,6,7]
-  strategy: ddp
+  devices: [2,4,6,7]
+  strategy: ddp_find_unused_parameters_true
 
 # =============================================================================
 # Model Mn
