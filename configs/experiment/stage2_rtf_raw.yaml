@@ -1,0 +1,87 @@
+# @package _global_
+#
+# Stage 2: Rectified Flow Training - Raw Mode (Data-to-Data Flow)
+#
+# 核心逻辑：
+# 1. mode: raw (直接在基因空间训练)
+# 2. Source: x_curr, Target: x_next (在 flow_module.py 中已修复)
+# 3. 适用场景：没有预训练 AE 时，或者需要直接预测全基因轨迹时
+
+defaults:
+  - override /data: rtf_tedd
+  - override /model: flow_stage2_cfg
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "rtf_stage2_raw_trajectory"
+
+tags: ["rtf", "flow", "raw_mode", "trajectory", "stage2"]
+
+seed: 42
+
+# =============================================================================
+# Trainer Settings
+# =============================================================================
+trainer:
+  min_epochs: 20
+  max_epochs: 50
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU Settings
+  accelerator: gpu
+  devices: [2,4,6,7]
+  strategy: ddp_find_unused_parameters_true
+
+# =============================================================================
+# Model Settings
+# =============================================================================
+model:
+  mode: raw
+  flow_type: rectified_flow
+
+  # Raw 模式不需要 AE
+  ae_ckpt_path: null  
+
+  optimizer:
+    lr: 5e-5  # Raw 模式建议稍低的学习率以提高稳定性
+    weight_decay: 1e-5
+
+  net:
+    input_dim: 28231      # 必须与 rtf_gene_list.txt 匹配
+    hidden_size: 768
+    depth: 16
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.1          # 增加少量 dropout 防止过拟合
+    cond_dropout: 0.15    
+
+# =============================================================================
+# Data Settings
+# =============================================================================
+data:
+  batch_size: 128         # Raw 模式维度大，适当减小 batch_size 以节省显存
+  num_workers: 8
+  max_time_days: 100.0    # 限制筛选时间范围
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 5
+    save_last: true
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-RTF-Raw"
+    name: "${task_name}_h${model.net.hidden_size}_d${model.net.depth}"
+    group: "raw_trajectory"

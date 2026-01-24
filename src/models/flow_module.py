@@ -61,7 +61,20 @@ class FlowLitModule(LightningModule):
         cond_data = batch['cond_meta']
         cond_data['x_curr'] = batch['x_curr']
         
-        loss = self.flow(x1, cond_data)
+        # [Critical Fix for Raw Mode]
+        # If mode is 'raw', we perform Data-to-Data flow (x_curr -> x_next).
+        # We pass x_curr as the source (x0) to the flow model.
+        # If mode is 'latent' (or None/default), we usually keep Noise -> Latent, 
+        # but passing x0=None lets RectifiedFlow default to noise.
+        # However, checking self.hparams.mode requires saving it properly.
+        # Let's infer from flow type or just pass x_curr if we believe Data-to-Data is always better for trajectories.
+        # But to be safe and specific to the fix:
+        
+        x0 = None
+        if self.hparams.mode == 'raw':
+            x0 = batch['x_curr']
+            
+        loss = self.flow(x1, cond_data, x0=x0)
         
         return loss
 

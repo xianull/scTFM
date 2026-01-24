@@ -25,11 +25,14 @@ class RectifiedFlow(BaseFlow):
     def __init__(self, backbone: nn.Module):
         super().__init__(backbone)
 
-    def forward(self, x1: torch.Tensor, cond_data: Dict[str, Any] = None) -> torch.Tensor:
+    def forward(self, x1: torch.Tensor, cond_data: Dict[str, Any] = None, x0: torch.Tensor = None) -> torch.Tensor:
         """
         训练阶段前向传播：计算 MSE Loss。
 
-        注意：CFG 的 condition dropout 由 backbone (DiTCrossAttn) 内部处理。
+        Args:
+            x1: Target data (x_next)
+            cond_data: Condition data
+            x0: Source data (x_curr). If None, use Gaussian Noise (standard Reflow).
         """
         batch_size = x1.shape[0]
         device = x1.device
@@ -38,8 +41,10 @@ class RectifiedFlow(BaseFlow):
         t = torch.rand(batch_size, device=device)
 
         # 2. 准备 Source 样本 x0
-        # Conditional Flow Matching: Source=Noise, Target=Data
-        x0 = torch.randn_like(x1)
+        if x0 is None:
+            # Standard Reflow: Source=Noise, Target=Data
+            x0 = torch.randn_like(x1)
+        # Else: Data-to-Data Flow: Source=x_curr, Target=x_next
 
         # 3. 线性插值构建 z_t
         t_expand = t.view(batch_size, 1)
