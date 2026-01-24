@@ -66,6 +66,10 @@ model:
     # 集合大小
     set_size: 128
 
+    # === 差异感知（所有策略共享）===
+    # 是否使用中心-邻居差异信息，解决同 niche 细胞 z 过于相似的问题
+    use_difference: true
+
     # === Contrastive 策略参数 ===
     contrastive_weight: 0.1
     temperature: 0.1

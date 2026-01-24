@@ -3,14 +3,20 @@ Set Single-Cell Autoencoder (SetSCAE)
 
 用于建模细胞微环境的自编码器框架。
 支持四种策略：
-1. GraphSetAE - 基于GAT的图自编码器
-2. ContrastiveSetAE - 对比学习自编码器
-3. MaskedSetAE - 掩码自编码器
-4. StackSetAE - 基于Stack论文的条件嵌入方法
+1. GraphSetAE - 基于GAT的图自编码器（带边特征）
+2. ContrastiveSetAE - 差异感知的对比学习自编码器
+3. MaskedSetAE - 差异感知的掩码自编码器
+4. StackSetAE - 差异感知的条件嵌入方法
+
+核心改进（2026-01-23）：
+- 所有策略都加入了"中心-邻居差异"信息
+- 解决同一 niche 中细胞 z_center 过于相似的问题
+- 让 context 依赖于中心细胞的视角
 
 核心思想：
 - 输入是一个细胞集合（中心细胞 + 邻居细胞）
 - 同时建模单细胞表达和微环境上下文
+- **新增**：建模中心-邻居的差异关系
 - 输出包含细胞级别和集合级别的表征
 
 参考:
@@ -150,6 +156,120 @@ class CellTypeEmbedding(nn.Module):
         return self.embedding(cell_types)
 
 
+class DifferenceAwareAggregator(nn.Module):
+    """
+    差异感知聚合器 - 所有策略共享的核心组件
+
+    核心思想：
+    - 不仅聚合邻居的表征，还聚合"中心-邻居差异"
+    - 这样不同中心细胞即使有相同邻居，也会得到不同的 context
+
+    聚合信息 = f(邻居表征, 中心-邻居差异)
+    """
+
+    def __init__(
+        self,
+        n_hidden: int,
+        aggregation: Literal['mean', 'attention', 'max'] = 'attention',
+        n_heads: int = 4,
+        dropout_rate: float = 0.1,
+        use_difference: bool = True,  # 是否使用差异信息
+    ):
+        super().__init__()
+
+        self.n_hidden = n_hidden
+        self.aggregation = aggregation
+        self.use_difference = use_difference
+
+        if use_difference:
+            # 差异信息投影：将 [neighbor; diff] 投影回 n_hidden
+            self.diff_proj = nn.Sequential(
+                nn.Linear(n_hidden * 2, n_hidden),
+                nn.LayerNorm(n_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+            )
+
+        if aggregation == 'attention':
+            self.n_heads = n_heads
+            self.head_dim = n_hidden // n_heads
+
+            self.query = nn.Linear(n_hidden, n_hidden)
+            self.key = nn.Linear(n_hidden, n_hidden)
+            self.value = nn.Linear(n_hidden, n_hidden)
+            self.out_proj = nn.Linear(n_hidden, n_hidden)
+
+    def forward(
+        self,
+        h_center: torch.Tensor,
+        h_neighbors: torch.Tensor,
+        neighbor_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            h_center: (batch, n_hidden) - 中心细胞表征
+            h_neighbors: (batch, n_neighbors, n_hidden) - 邻居细胞表征
+            neighbor_mask: (batch, n_neighbors) - 邻居掩码，True 表示有效
+
+        Returns:
+            context: (batch, n_hidden) - 差异感知的上下文向量
+        """
+        batch_size, n_neighbors, n_hidden = h_neighbors.shape
+
+        # 计算差异信息
+        if self.use_difference:
+            # 中心与每个邻居的差异
+            diff = h_neighbors - h_center.unsqueeze(1)  # (batch, n_neighbors, n_hidden)
+
+            # 拼接邻居表征和差异
+            combined = torch.cat([h_neighbors, diff], dim=-1)  # (batch, n_neighbors, 2*n_hidden)
+
+            # 投影回 n_hidden
+            h_neighbors = self.diff_proj(combined)  # (batch, n_neighbors, n_hidden)
+
+        # 聚合
+        if self.aggregation == 'mean':
+            if neighbor_mask is not None:
+                mask = neighbor_mask.unsqueeze(-1).float()
+                context = (h_neighbors * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            else:
+                context = h_neighbors.mean(dim=1)
+
+        elif self.aggregation == 'max':
+            if neighbor_mask is not None:
+                h_neighbors = h_neighbors.masked_fill(
+                    ~neighbor_mask.unsqueeze(-1), float('-inf')
+                )
+            context = h_neighbors.max(dim=1)[0]
+
+        elif self.aggregation == 'attention':
+            # 多头注意力：中心细胞作为 Query，邻居作为 Key/Value
+            Q = self.query(h_center)  # (batch, n_hidden)
+            K = self.key(h_neighbors)  # (batch, n_neighbors, n_hidden)
+            V = self.value(h_neighbors)  # (batch, n_neighbors, n_hidden)
+
+            # 重塑为多头
+            Q = Q.view(batch_size, 1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+            K = K.view(batch_size, n_neighbors, self.n_heads, self.head_dim).permute(0, 2, 3, 1)
+            V = V.view(batch_size, n_neighbors, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            # 注意力分数
+            attn = torch.matmul(Q, K) / math.sqrt(self.head_dim)  # (batch, heads, 1, n_neighbors)
+
+            if neighbor_mask is not None:
+                mask = neighbor_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_neighbors)
+                attn = attn.masked_fill(~mask, float('-inf'))
+
+            attn = F.softmax(attn, dim=-1)
+
+            # 聚合
+            context = torch.matmul(attn, V)  # (batch, heads, 1, head_dim)
+            context = context.permute(0, 2, 1, 3).reshape(batch_size, n_hidden)
+            context = self.out_proj(context)
+
+        return context
+
+
 # =============================================================================
 # 基础 SetSCAE 类
 # =============================================================================
@@ -164,6 +284,10 @@ class BaseSetSCAE(nn.Module, ABC):
     - 基类只包含真正共享的组件（decoder、NB参数）
     - encoder 由各子类自己定义，避免 DDP 未使用参数问题
     - 子类需要实现 _build_encoder() 方法
+
+    核心改进（2026-01-23）：
+    - 新增 use_difference 参数，控制是否使用中心-邻居差异信息
+    - 解决同一 niche 中细胞 z_center 过于相似的问题
     """
 
     def __init__(
@@ -178,6 +302,7 @@ class BaseSetSCAE(nn.Module, ABC):
         dispersion: Literal['gene', 'gene-cell'] = 'gene',
         gene_likelihood: Literal['nb', 'zinb'] = 'nb',
         set_size: int = 16,
+        use_difference: bool = True,  # 新增：是否使用差异信息
         **kwargs
     ):
         super().__init__()
@@ -192,6 +317,7 @@ class BaseSetSCAE(nn.Module, ABC):
         self.dispersion = dispersion
         self.gene_likelihood = gene_likelihood
         self.set_size = set_size
+        self.use_difference = use_difference  # 是否使用差异信息
 
         # 注意：encoder 由子类在 _build_encoder() 中定义
         # 这样可以避免 DDP 未使用参数问题
@@ -305,7 +431,13 @@ class BaseSetSCAE(nn.Module, ABC):
 # =============================================================================
 
 class GraphAttentionLayer(nn.Module):
-    """图注意力层"""
+    """
+    图注意力层（支持边特征）
+
+    改进（2026-01-23）：
+    - 新增 edge_features 支持
+    - 边特征 = 中心-邻居差异，让注意力权重考虑节点间关系
+    """
 
     def __init__(
         self,
@@ -314,12 +446,14 @@ class GraphAttentionLayer(nn.Module):
         n_heads: int = 4,
         dropout: float = 0.1,
         concat: bool = True,
+        use_edge_features: bool = True,  # 新增：是否使用边特征
     ):
         super().__init__()
 
         self.n_heads = n_heads
         self.out_features = out_features
         self.concat = concat
+        self.use_edge_features = use_edge_features
 
         # 每个头的维度
         self.head_dim = out_features // n_heads if concat else out_features
@@ -331,6 +465,11 @@ class GraphAttentionLayer(nn.Module):
         self.a_src = nn.Parameter(torch.zeros(n_heads, self.head_dim))
         self.a_dst = nn.Parameter(torch.zeros(n_heads, self.head_dim))
 
+        # 边特征投影（新增）
+        if use_edge_features:
+            self.a_edge = nn.Parameter(torch.zeros(n_heads, self.head_dim))
+            self.edge_proj = nn.Linear(in_features, self.head_dim * n_heads, bias=False)
+
         self.leaky_relu = nn.LeakyReLU(0.2)
         self.dropout = nn.Dropout(dropout)
 
@@ -340,16 +479,21 @@ class GraphAttentionLayer(nn.Module):
         nn.init.xavier_uniform_(self.W.weight)
         nn.init.xavier_uniform_(self.a_src)
         nn.init.xavier_uniform_(self.a_dst)
+        if self.use_edge_features:
+            nn.init.xavier_uniform_(self.a_edge)
+            nn.init.xavier_uniform_(self.edge_proj.weight)
 
     def forward(
         self,
         x: torch.Tensor,
-        adj: Optional[torch.Tensor] = None
+        adj: Optional[torch.Tensor] = None,
+        edge_features: Optional[torch.Tensor] = None,  # 新增：边特征
     ) -> torch.Tensor:
         """
         Args:
             x: (batch, n_nodes, in_features)
             adj: (batch, n_nodes, n_nodes) 邻接矩阵，None表示全连接
+            edge_features: (batch, n_nodes, n_nodes, in_features) 边特征（可选）
 
         Returns:
             (batch, n_nodes, out_features)
@@ -368,6 +512,17 @@ class GraphAttentionLayer(nn.Module):
 
         # (batch, n_nodes, n_nodes, n_heads)
         attn = attn_src.unsqueeze(2) + attn_dst.unsqueeze(1)
+
+        # 加入边特征的贡献（新增）
+        if self.use_edge_features and edge_features is not None:
+            # edge_features: (batch, n_nodes, n_nodes, in_features)
+            # 投影: (batch, n_nodes, n_nodes, n_heads * head_dim)
+            e = self.edge_proj(edge_features)
+            e = e.view(batch_size, n_nodes, n_nodes, self.n_heads, self.head_dim)
+            # (batch, n_nodes, n_nodes, n_heads)
+            attn_edge = (e * self.a_edge).sum(dim=-1)
+            attn = attn + attn_edge
+
         attn = self.leaky_relu(attn)
 
         # 应用邻接矩阵mask
@@ -398,12 +553,17 @@ class GraphAttentionLayer(nn.Module):
 
 class GraphSetAE(BaseSetSCAE):
     """
-    方案一: 基于GAT的图自编码器
+    方案一: 基于GAT的图自编码器（带边特征）
 
     通过图注意力网络在编码阶段引入微环境信息。
     双重解码器：特征重建 + 链路预测
 
-    编码器架构：input_proj + GAT layers
+    改进（2026-01-23）：
+    - 新增边特征支持：edge_ij = h_i - h_j（节点差异）
+    - 让 GAT 注意力权重考虑节点间关系，而不仅仅是节点自身特征
+    - 解决同一 niche 中细胞 z 过于相似的问题
+
+    编码器架构：input_proj + GAT layers (with edge features)
     """
 
     def __init__(
@@ -421,6 +581,7 @@ class GraphSetAE(BaseSetSCAE):
         gene_likelihood: Literal['nb', 'zinb'] = 'nb',
         set_size: int = 16,
         link_pred_weight: float = 0.1,
+        use_difference: bool = True,  # 新增：是否使用差异作为边特征
         **kwargs
     ):
         super().__init__(
@@ -434,6 +595,7 @@ class GraphSetAE(BaseSetSCAE):
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             set_size=set_size,
+            use_difference=use_difference,
             **kwargs
         )
 
@@ -447,7 +609,7 @@ class GraphSetAE(BaseSetSCAE):
             nn.Dropout(dropout_rate),
         )
 
-        # GAT 层
+        # GAT 层（支持边特征）
         self.gat_layers = nn.ModuleList()
         for i in range(n_gat_layers):
             self.gat_layers.append(
@@ -457,6 +619,7 @@ class GraphSetAE(BaseSetSCAE):
                     n_heads=n_heads,
                     dropout=dropout_rate,
                     concat=True,
+                    use_edge_features=use_difference,  # 使用差异作为边特征
                 )
             )
             self.gat_layers.append(nn.LayerNorm(n_hidden))
@@ -467,6 +630,24 @@ class GraphSetAE(BaseSetSCAE):
 
         self._init_weights()
 
+    def _compute_edge_features(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        计算边特征（节点差异）
+
+        Args:
+            h: (batch, n_nodes, n_hidden) 节点特征
+
+        Returns:
+            edge_features: (batch, n_nodes, n_nodes, n_hidden)
+            edge_ij = h_i - h_j（从 j 指向 i 的边特征）
+        """
+        batch_size, n_nodes, n_hidden = h.shape
+        # h_i: (batch, n_nodes, 1, n_hidden)
+        # h_j: (batch, 1, n_nodes, n_hidden)
+        # edge_ij = h_i - h_j: (batch, n_nodes, n_nodes, n_hidden)
+        edge_features = h.unsqueeze(2) - h.unsqueeze(1)
+        return edge_features
+
     def encode(
         self,
         x_set: torch.Tensor,
@@ -474,7 +655,7 @@ class GraphSetAE(BaseSetSCAE):
         **kwargs
     ) -> torch.Tensor:
         """
-        GAT 编码
+        GAT 编码（带边特征）
 
         Args:
             x_set: (batch, set_size, n_genes)
@@ -486,10 +667,14 @@ class GraphSetAE(BaseSetSCAE):
         # 输入投影
         h = self.input_proj(x_set)  # (batch, set_size, n_hidden)
 
-        # GAT 编码
+        # GAT 编码（每层更新边特征）
         for layer in self.gat_layers:
             if isinstance(layer, GraphAttentionLayer):
-                h = layer(h, adj)
+                # 计算边特征（如果启用）
+                edge_features = None
+                if self.use_difference:
+                    edge_features = self._compute_edge_features(h)
+                h = layer(h, adj, edge_features=edge_features)
             else:
                 h = layer(h)
 
@@ -518,7 +703,7 @@ class GraphSetAE(BaseSetSCAE):
         if library_size is None:
             library_size = torch.expm1(x_set).sum(dim=-1).clamp(min=1.0)
 
-        # GAT 编码
+        # GAT 编码（带边特征）
         z_all = self.encode(x_set, adj=adj)  # (batch, set_size, n_latent)
         z_center = z_all[:, center_idx, :]  # (batch, n_latent)
 
@@ -595,13 +780,18 @@ class GraphSetAE(BaseSetSCAE):
 
 class ContrastiveSetAE(BaseSetSCAE):
     """
-    方案二: 对比学习自编码器
+    方案二: 差异感知的对比学习自编码器
 
     通过 InfoNCE 损失强制 Latent 空间在局部邻域内保持平滑。
     正样本：空间邻居细胞
     负样本：随机采样的非邻居细胞
 
-    编码器架构：标准 scVI-style Encoder
+    改进（2026-01-23）：
+    - 新增差异感知的投影头
+    - 对比学习时考虑 [z_neighbor; z_center - z_neighbor]
+    - 让正样本分数不仅依赖邻居自身，还依赖与中心的关系
+
+    编码器架构：标准 scVI-style Encoder + 差异感知投影头
     """
 
     def __init__(
@@ -619,6 +809,7 @@ class ContrastiveSetAE(BaseSetSCAE):
         contrastive_weight: float = 0.1,
         temperature: float = 0.1,
         n_negatives: int = 64,
+        use_difference: bool = True,  # 新增：是否使用差异感知
         **kwargs
     ):
         super().__init__(
@@ -632,6 +823,7 @@ class ContrastiveSetAE(BaseSetSCAE):
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             set_size=set_size,
+            use_difference=use_difference,
             **kwargs
         )
 
@@ -654,11 +846,28 @@ class ContrastiveSetAE(BaseSetSCAE):
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
         # 投影头 (用于对比学习)
-        self.projection_head = nn.Sequential(
-            nn.Linear(n_latent, n_hidden),
-            nn.GELU(),
-            nn.Linear(n_hidden, n_latent),
-        )
+        if use_difference:
+            # 差异感知的投影头：输入 [z; diff]
+            self.projection_head = nn.Sequential(
+                nn.Linear(n_latent * 2, n_hidden),
+                nn.GELU(),
+                nn.LayerNorm(n_hidden),
+                nn.Linear(n_hidden, n_latent),
+            )
+            # 中心细胞的投影（不需要差异）
+            self.center_projection = nn.Sequential(
+                nn.Linear(n_latent, n_hidden),
+                nn.GELU(),
+                nn.LayerNorm(n_hidden),
+                nn.Linear(n_hidden, n_latent),
+            )
+        else:
+            # 原始投影头
+            self.projection_head = nn.Sequential(
+                nn.Linear(n_latent, n_hidden),
+                nn.GELU(),
+                nn.Linear(n_hidden, n_latent),
+            )
 
         self._init_weights()
 
@@ -711,9 +920,21 @@ class ContrastiveSetAE(BaseSetSCAE):
         # 中心细胞
         z_center = z_all[:, center_idx, :]
 
-        # 投影到对比学习空间
-        proj_all = self.projection_head(z_all)
-        proj_center = proj_all[:, center_idx, :]
+        # 投影到对比学习空间（差异感知）
+        if self.use_difference:
+            # 中心细胞的投影
+            proj_center = self.center_projection(z_center)  # (batch, n_latent)
+
+            # 邻居的差异感知投影
+            # z_neighbors: (batch, set_size, n_latent)
+            # diff: z_neighbor - z_center
+            diff_all = z_all - z_center.unsqueeze(1)  # (batch, set_size, n_latent)
+            # 拼接 [z; diff]
+            z_with_diff = torch.cat([z_all, diff_all], dim=-1)  # (batch, set_size, 2*n_latent)
+            proj_all = self.projection_head(z_with_diff)  # (batch, set_size, n_latent)
+        else:
+            proj_all = self.projection_head(z_all)
+            proj_center = proj_all[:, center_idx, :]
 
         # 解码所有细胞 (不仅仅是中心细胞)
         lib_flat = library_size.view(-1)  # (batch * set_size,)
@@ -845,14 +1066,19 @@ class ContrastiveSetAE(BaseSetSCAE):
 
 class MaskedSetAE(BaseSetSCAE):
     """
-    方案三: 上下文感知的掩码自编码器
+    方案三: 差异感知的掩码自编码器
 
     借鉴 MAE/scGPT 的思路，通过预测被掩码的信息来学习微环境。
     - 输入：中心细胞 + 邻居细胞
     - 掩码：随机遮盖中心细胞的部分基因
     - 预测：利用邻居信息预测被遮盖的基因
 
-    编码器架构：input_proj + Transformer context_encoder
+    改进（2026-01-23）：
+    - 新增差异感知的相对位置编码
+    - 在 Transformer 输入中加入 center-neighbor 差异信息
+    - 让上下文编码更好地捕捉中心细胞与邻居的关系
+
+    编码器架构：input_proj + 差异编码 + Transformer context_encoder
     """
 
     def __init__(
@@ -871,6 +1097,7 @@ class MaskedSetAE(BaseSetSCAE):
         set_size: int = 16,
         mask_ratio: float = 0.3,
         mask_strategy: Literal['random', 'hvg', 'block'] = 'random',
+        use_difference: bool = True,  # 新增：是否使用差异感知
         **kwargs
     ):
         super().__init__(
@@ -884,6 +1111,7 @@ class MaskedSetAE(BaseSetSCAE):
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             set_size=set_size,
+            use_difference=use_difference,
             **kwargs
         )
 
@@ -903,6 +1131,16 @@ class MaskedSetAE(BaseSetSCAE):
             nn.GELU(),
             nn.Dropout(dropout_rate),
         )
+
+        # 差异编码（新增）
+        if use_difference:
+            # 将差异信息融入表征
+            self.diff_encoder = nn.Sequential(
+                nn.Linear(n_hidden * 2, n_hidden),
+                nn.LayerNorm(n_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+            )
 
         # 上下文 Transformer 编码器
         encoder_layer = nn.TransformerEncoderLayer(
@@ -931,6 +1169,40 @@ class MaskedSetAE(BaseSetSCAE):
 
         self._init_weights()
 
+    def _add_difference_encoding(
+        self,
+        h_set: torch.Tensor,
+        center_idx: int = 0
+    ) -> torch.Tensor:
+        """
+        添加差异编码
+
+        Args:
+            h_set: (batch, set_size, n_hidden) - 投影后的表征
+            center_idx: 中心细胞索引
+
+        Returns:
+            h_set_with_diff: (batch, set_size, n_hidden) - 加入差异信息的表征
+        """
+        if not self.use_difference:
+            return h_set
+
+        batch_size, set_size, n_hidden = h_set.shape
+
+        # 获取中心细胞表征
+        h_center = h_set[:, center_idx, :]  # (batch, n_hidden)
+
+        # 计算每个细胞与中心的差异
+        diff = h_set - h_center.unsqueeze(1)  # (batch, set_size, n_hidden)
+
+        # 拼接原始表征和差异
+        h_with_diff = torch.cat([h_set, diff], dim=-1)  # (batch, set_size, 2*n_hidden)
+
+        # 投影回 n_hidden
+        h_set_with_diff = self.diff_encoder(h_with_diff)  # (batch, set_size, n_hidden)
+
+        return h_set_with_diff
+
     def encode(
         self,
         x_set: torch.Tensor,
@@ -939,7 +1211,7 @@ class MaskedSetAE(BaseSetSCAE):
         **kwargs
     ) -> torch.Tensor:
         """
-        上下文感知编码
+        差异感知的上下文编码
 
         Args:
             x_set: (batch, set_size, n_genes)
@@ -953,6 +1225,9 @@ class MaskedSetAE(BaseSetSCAE):
 
         # 投影所有细胞
         h_set = self.input_proj(x_set)  # (batch, set_size, n_hidden)
+
+        # 添加差异编码（新增）
+        h_set = self._add_difference_encoding(h_set, center_idx)
 
         # 如果有掩码，对中心细胞应用掩码
         if gene_mask is not None:
@@ -1048,6 +1323,9 @@ class MaskedSetAE(BaseSetSCAE):
 
         # 投影所有细胞
         h_set = self.input_proj(x_set)  # (batch, set_size, n_hidden)
+
+        # 添加差异编码（新增）
+        h_set = self._add_difference_encoding(h_set, center_idx)
 
         # 对中心细胞应用掩码: 用 mask_token 替换
         h_center = h_set[:, center_idx, :].clone()  # (batch, n_hidden)
@@ -1147,15 +1425,20 @@ class MaskedSetAE(BaseSetSCAE):
 
 class StackSetAE(BaseSetSCAE):
     """
-    方案四: 基于Stack论文的条件嵌入自编码器
+    方案四: 差异感知的条件嵌入自编码器
 
     核心思想（参考 Stack 论文）：
     - 使用条件嵌入 (condition embedding) 来编码微环境信息
     - 通过 concatenation 或 addition 将条件信息注入 latent space
     - 简单、统一、无需为不同条件设计不同架构
 
+    改进（2026-01-23）：
+    - 使用 DifferenceAwareAggregator 聚合邻居信息
+    - context = f(邻居表征, 中心-邻居差异)
+    - 解决同一 niche 中细胞 z_center 过于相似的问题
+
     工作流程：
-    1. 对邻居细胞进行聚合，得到微环境上下文向量
+    1. 对邻居细胞进行**差异感知聚合**，得到微环境上下文向量
     2. 将上下文向量作为条件信息注入到中心细胞的编码过程
     3. 条件注入方式：concat, add, 或 film (Feature-wise Linear Modulation)
 
@@ -1163,6 +1446,7 @@ class StackSetAE(BaseSetSCAE):
     - 架构简单，易于理解和调试
     - 与标准 scVI 编码器兼容
     - 灵活的条件注入方式
+    - **差异感知**：不同中心细胞得到不同的 context
     """
 
     def __init__(
@@ -1182,6 +1466,7 @@ class StackSetAE(BaseSetSCAE):
         condition_injection: Literal['concat', 'add', 'film'] = 'concat',
         context_weight: float = 1.0,
         n_context_heads: int = 4,
+        use_difference: bool = True,  # 新增：是否使用差异感知
         **kwargs
     ):
         super().__init__(
@@ -1195,6 +1480,7 @@ class StackSetAE(BaseSetSCAE):
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             set_size=set_size,
+            use_difference=use_difference,
             **kwargs
         )
 
@@ -1213,15 +1499,14 @@ class StackSetAE(BaseSetSCAE):
             use_residual=use_residual,
         )
 
-        # 上下文聚合模块
-        if context_aggregation == 'attention':
-            # 使用注意力机制聚合邻居信息
-            self.context_query = nn.Linear(n_hidden, n_hidden)
-            self.context_key = nn.Linear(n_hidden, n_hidden)
-            self.context_value = nn.Linear(n_hidden, n_hidden)
-            self.context_heads = n_context_heads
-            self.context_head_dim = n_hidden // n_context_heads
-            self.context_out = nn.Linear(n_hidden, n_hidden)
+        # 使用差异感知聚合器（新增）
+        self.context_aggregator = DifferenceAwareAggregator(
+            n_hidden=n_hidden,
+            aggregation=context_aggregation,
+            n_heads=n_context_heads,
+            dropout_rate=dropout_rate,
+            use_difference=use_difference,
+        )
 
         # 条件注入模块
         if condition_injection == 'concat':
@@ -1238,76 +1523,6 @@ class StackSetAE(BaseSetSCAE):
             self.film_beta = nn.Linear(n_hidden, n_hidden)
 
         self._init_weights()
-
-    def aggregate_context(
-        self,
-        h_center: torch.Tensor,
-        h_neighbors: torch.Tensor,
-        neighbor_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        聚合邻居细胞的上下文信息
-
-        Args:
-            h_center: (batch, n_hidden) - 中心细胞的隐藏表征
-            h_neighbors: (batch, n_neighbors, n_hidden) - 邻居细胞的隐藏表征
-            neighbor_mask: (batch, n_neighbors) - 邻居掩码，True表示有效
-
-        Returns:
-            context: (batch, n_hidden) - 聚合后的上下文向量
-        """
-        batch_size, n_neighbors, n_hidden = h_neighbors.shape
-
-        if self.context_aggregation == 'mean':
-            if neighbor_mask is not None:
-                # 带掩码的平均
-                mask = neighbor_mask.unsqueeze(-1).float()
-                context = (h_neighbors * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            else:
-                context = h_neighbors.mean(dim=1)
-
-        elif self.context_aggregation == 'max':
-            if neighbor_mask is not None:
-                # 带掩码的最大池化
-                h_neighbors = h_neighbors.masked_fill(
-                    ~neighbor_mask.unsqueeze(-1), float('-inf')
-                )
-            context = h_neighbors.max(dim=1)[0]
-
-        elif self.context_aggregation == 'attention':
-            # 多头注意力聚合
-            # Query: 中心细胞, Key/Value: 邻居细胞
-            Q = self.context_query(h_center)  # (batch, n_hidden)
-            K = self.context_key(h_neighbors)  # (batch, n_neighbors, n_hidden)
-            V = self.context_value(h_neighbors)  # (batch, n_neighbors, n_hidden)
-
-            # 重塑为多头
-            Q = Q.view(batch_size, 1, self.context_heads, self.context_head_dim)
-            K = K.view(batch_size, n_neighbors, self.context_heads, self.context_head_dim)
-            V = V.view(batch_size, n_neighbors, self.context_heads, self.context_head_dim)
-
-            # (batch, heads, 1, head_dim) @ (batch, heads, head_dim, n_neighbors)
-            Q = Q.permute(0, 2, 1, 3)  # (batch, heads, 1, head_dim)
-            K = K.permute(0, 2, 3, 1)  # (batch, heads, head_dim, n_neighbors)
-            V = V.permute(0, 2, 1, 3)  # (batch, heads, n_neighbors, head_dim)
-
-            # 注意力分数
-            attn = torch.matmul(Q, K) / math.sqrt(self.context_head_dim)
-            # (batch, heads, 1, n_neighbors)
-
-            if neighbor_mask is not None:
-                # 应用掩码
-                mask = neighbor_mask.unsqueeze(1).unsqueeze(2)  # (batch, 1, 1, n_neighbors)
-                attn = attn.masked_fill(~mask, float('-inf'))
-
-            attn = F.softmax(attn, dim=-1)
-
-            # 聚合
-            context = torch.matmul(attn, V)  # (batch, heads, 1, head_dim)
-            context = context.permute(0, 2, 1, 3).reshape(batch_size, n_hidden)
-            context = self.context_out(context)
-
-        return context
 
     def inject_condition(
         self,
@@ -1372,7 +1587,7 @@ class StackSetAE(BaseSetSCAE):
         neighbor_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        计算上下文向量
+        计算差异感知的上下文向量
 
         Args:
             h_all: (batch, set_size, n_hidden)
@@ -1381,7 +1596,7 @@ class StackSetAE(BaseSetSCAE):
 
         Returns:
             h_center: (batch, n_hidden)
-            context: (batch, n_hidden)
+            context: (batch, n_hidden) - 差异感知的上下文
         """
         batch_size, set_size, _ = h_all.shape
 
@@ -1398,8 +1613,8 @@ class StackSetAE(BaseSetSCAE):
         else:
             neighbor_mask_filtered = None
 
-        # 聚合上下文
-        context = self.aggregate_context(h_center, h_neighbors, neighbor_mask_filtered)
+        # 使用差异感知聚合器
+        context = self.context_aggregator(h_center, h_neighbors, neighbor_mask_filtered)
 
         return h_center, context
 
@@ -1457,7 +1672,7 @@ class StackSetAE(BaseSetSCAE):
         # 编码所有细胞（只调用一次 cell_encoder）
         h_all = self._encode_all_cells(x_set)
 
-        # 计算上下文
+        # 计算差异感知的上下文
         h_center, context = self._compute_context(h_all, center_idx, neighbor_mask)
 
         # 为所有细胞生成 z（使用相同的上下文）
