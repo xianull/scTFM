@@ -34,14 +34,14 @@ seed: 42
 # =============================================================================
 trainer:
   min_epochs: 2
-  max_epochs: 10
+  max_epochs: 30
   gradient_clip_val: 1.0
   precision: 16-mixed
 
   # GPU 配置
   accelerator: gpu
-  devices: [0]
-  # strategy: ddp  # 多卡时启用
+  devices: [0,1,2,3]
+  strategy: ddp_find_unused_parameters_true  # 多卡时启用
 
 # =============================================================================
 # Model

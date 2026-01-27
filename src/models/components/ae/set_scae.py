@@ -628,6 +628,10 @@ class GraphSetAE(BaseSetSCAE):
         # 潜在空间投影
         self.z_mean = nn.Linear(n_hidden, n_latent)
 
+        # 链接预测温度参数 (Logit Scale)
+        # 初始化为 exp(2.65) ≈ 14.1，使得初始 sigmoid(sim * scale) 在 sim=0.1 时有明显区分
+        self.logit_scale = nn.Parameter(torch.ones([]) * 2.65)
+
         self._init_weights()
 
     def _compute_edge_features(self, h: torch.Tensor) -> torch.Tensor:
@@ -716,9 +720,12 @@ class GraphSetAE(BaseSetSCAE):
         mu_all = decoded['mu'].view(batch_size, set_size, -1)
         theta_all = decoded['theta'].view(batch_size, set_size, -1)
 
-        # 链路预测 (内积)
+        # 链路预测 (内积 + Temperature Scaling)
         z_norm = F.normalize(z_all, dim=-1)
-        adj_pred = torch.bmm(z_norm, z_norm.transpose(1, 2))
+        # Cosine similarity [-1, 1]
+        sim_matrix = torch.bmm(z_norm, z_norm.transpose(1, 2))
+        # Scale to logits: [-1, 1] -> [-scale, scale]
+        adj_pred = sim_matrix * self.logit_scale.exp()
 
         outputs = {
             'z_all': z_all,
@@ -1618,6 +1625,64 @@ class StackSetAE(BaseSetSCAE):
 
         return h_center, context
 
+    def _compute_context_vectorized(
+        self,
+        h_all: torch.Tensor,
+        neighbor_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        向量化计算所有细胞的上下文
+
+        Args:
+            h_all: (batch, set_size, n_hidden)
+            neighbor_mask: (batch, set_size)
+
+        Returns:
+            h_centers: (batch * set_size, n_hidden) - 扁平化的中心细胞
+            context: (batch * set_size, n_hidden) - 对应的上下文
+        """
+        batch_size, set_size, n_hidden = h_all.shape
+
+        # 1. 准备 Center (batch * set_size, n_hidden)
+        h_centers = h_all.view(-1, n_hidden)
+
+        # 2. 准备 Neighbors (batch, set_size, set_size-1, n_hidden)
+        # 这是一个技巧：我们需要为每个细胞收集它的 set_size-1 个邻居
+        # 方法是构建 mask 并索引，或者使用 roll/expand
+        
+        # 使用 expand 和 diagonal mask 的方式：
+        # (batch, set_size_center, set_size_neighbor, hidden)
+        expanded = h_all.unsqueeze(1).expand(-1, set_size, -1, -1)
+        
+        # 创建对角线掩码 (即排除自身)
+        eye = torch.eye(set_size, device=h_all.device, dtype=torch.bool)
+        # mask: (set_size, set_size) -> (1, set_size, set_size, 1)
+        mask = ~eye.view(1, set_size, set_size, 1)
+        
+        # 选取非对角线元素
+        # masked_select 会展平，所以我们需要重新 reshape
+        # 结果应该是 (batch, set_size, set_size-1, n_hidden)
+        h_neighbors = torch.masked_select(expanded, mask).view(batch_size, set_size, set_size - 1, n_hidden)
+        
+        # reshape 为 (batch * set_size, set_size-1, n_hidden)
+        h_neighbors_flat = h_neighbors.view(-1, set_size - 1, n_hidden)
+
+        # 3. 处理 Neighbor Mask
+        neighbor_mask_flat = None
+        if neighbor_mask is not None:
+            # neighbor_mask: (batch, set_size)
+            # 扩展: (batch, set_size_center, set_size_neighbor)
+            nm_expanded = neighbor_mask.unsqueeze(1).expand(-1, set_size, -1)
+            # 应用同样的对角线剔除
+            mask_2d = ~eye.view(1, set_size, set_size)
+            nm_selected = torch.masked_select(nm_expanded, mask_2d).view(batch_size, set_size, set_size - 1)
+            neighbor_mask_flat = nm_selected.view(-1, set_size - 1)
+
+        # 4. 计算上下文 (batch * set_size)
+        context = self.context_aggregator(h_centers, h_neighbors_flat, neighbor_mask_flat)
+
+        return h_centers, context
+
     def encode(
         self,
         x_set: torch.Tensor,
@@ -1626,7 +1691,7 @@ class StackSetAE(BaseSetSCAE):
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        编码细胞集合
+        编码细胞集合 (单中心模式)
 
         Args:
             x_set: (batch, set_size, n_genes)
@@ -1634,13 +1699,14 @@ class StackSetAE(BaseSetSCAE):
             neighbor_mask: (batch, set_size) 邻居掩码
 
         Returns:
-            z_center: (batch, n_latent) - 条件化的中心细胞潜在表征
-            context: (batch, n_hidden) - 上下文向量
+            z_center: (batch, n_latent)
+            context: (batch, n_hidden)
         """
         # 编码所有细胞
         h_all = self._encode_all_cells(x_set)
 
-        # 计算上下文
+        # 这里我们可以复用 _compute_context 单中心版，或者用 _compute_context_vectorized 提取
+        # 为了兼容性，保留单中心逻辑
         h_center, context = self._compute_context(h_all, center_idx, neighbor_mask)
 
         # 条件注入得到 z
@@ -1669,23 +1735,24 @@ class StackSetAE(BaseSetSCAE):
         if library_size is None:
             library_size = torch.expm1(x_set).sum(dim=-1).clamp(min=1.0)
 
-        # 编码所有细胞（只调用一次 cell_encoder）
+        # 1. 编码所有细胞
         h_all = self._encode_all_cells(x_set)
 
-        # 计算差异感知的上下文
-        h_center, context = self._compute_context(h_all, center_idx, neighbor_mask)
+        # 2. 向量化计算所有细胞的上下文
+        # h_centers_flat: (batch * set_size, n_hidden)
+        # context_flat: (batch * set_size, n_hidden)
+        h_centers_flat, context_flat = self._compute_context_vectorized(h_all, neighbor_mask)
 
-        # 为所有细胞生成 z（使用相同的上下文）
-        z_all_list = []
-        for i in range(set_size):
-            z_i = self.inject_condition(h_all[:, i, :], context)
-            z_all_list.append(z_i.unsqueeze(1))
-        z_all = torch.cat(z_all_list, dim=1)  # (batch, set_size, n_latent)
+        # 3. 注入条件
+        z_flat = self.inject_condition(h_centers_flat, context_flat)
+        # reshape: (batch, set_size, n_latent)
+        z_all = z_flat.view(batch_size, set_size, -1)
 
+        # 4. 获取结果
         z_center = z_all[:, center_idx, :]
+        context_center = context_flat.view(batch_size, set_size, -1)[:, center_idx, :]
 
-        # 解码所有细胞
-        z_flat = z_all.view(-1, z_all.size(-1))
+        # 5. 解码所有细胞
         lib_flat = library_size.view(-1)
         decoded = self.decode_cell(z_flat, lib_flat)
 
@@ -1696,7 +1763,7 @@ class StackSetAE(BaseSetSCAE):
         outputs = {
             'z_all': z_all,
             'z_center': z_center,
-            'context': context,
+            'context': context_center,
             'mu_all': mu_all,
             'theta_all': theta_all,
             'mu': mu_all[:, center_idx, :],

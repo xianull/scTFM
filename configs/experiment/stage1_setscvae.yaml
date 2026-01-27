@@ -1,0 +1,124 @@
+# @package _global_
+#
+# Stage 1: SetSCVAE (Variational Autoencoder) Training
+#
+# 训练目标：
+# 1. 学习细胞及其微环境的潜在表示 (z_center)
+# 2. VAE 正则化潜在空间，使其更平滑，适合作为 Rectified Flow 的条件
+# 3. 建模中心细胞与邻居细胞的差异关系
+
+defaults:
+  - override /data: neighborhood_tedd
+  - override /model: setscae_stage1  # 使用 SetSCAE 的基础 Module 封装
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "setscvae_stage1"
+
+tags: ["setscvae", "vae", "stage1", "neighborhood"]
+
+seed: 42
+
+# =============================================================================
+# Trainer Settings
+# =============================================================================
+trainer:
+  min_epochs: 10
+  max_epochs: 50
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU Settings
+  accelerator: gpu
+  devices: [0]
+  # strategy: ddp_find_unused_parameters_true
+
+# =============================================================================
+# Model Settings
+# =============================================================================
+model:
+  # 使用 SetSCVAE
+  net:
+    _target_: src.models.components.ae.set_scvae.SetSCVAE
+    
+    # 策略选择 (graph, contrastive, masked, stack)
+    strategy: stack
+    
+    # 维度参数
+    n_input: 28231
+    n_hidden: 256
+    n_latent: 64
+    n_layers: 2
+    
+    # 训练参数
+    dropout_rate: 0.1
+    activation: GELU
+    use_residual: true
+    dispersion: gene
+    gene_likelihood: nb
+    
+    # Set 参数
+    set_size: 128
+    use_difference: true  # 启用中心-邻居差异特征
+    
+    # VAE 参数
+    kl_weight: 0.001      # KL 散度权重 (Beta-VAE)
+    
+    # 策略特定参数 (Stack)
+    context_aggregation: attention
+    condition_injection: concat
+    context_weight: 1.0
+    n_context_heads: 4
+
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  scheduler:
+    factor: 0.5
+    patience: 5
+
+# =============================================================================
+# Data Settings
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  set_size: 16          # 邻居数量
+  bag_size: 32          # Bag 采样大小 (如果使用 BagDataModule)
+  
+# =============================================================================
+# Callbacks
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+
+  early_stopping:
+    monitor: "train/loss"
+    patience: 10
+    mode: "min"
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-SetSCVAE"
+    name: "${task_name}_${model.net.strategy}"
+    tags: ${tags}
+    group: "stage1_vae"
+
+# =============================================================================
+# Hydra Multirun - 同时跑四种策略
+# =============================================================================
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      model.net.strategy: graph,contrastive,masked,stack

@@ -49,6 +49,7 @@ class RTFDataModule(LightningDataModule):
         stage_info_path: Optional[str] = None,  # Stage 信息 CSV 路径
         use_log_time: bool = True,  # 是否使用 log-scale 时间归一化
         max_time_days: Optional[float] = None,  # 最大时间筛选（天），None 表示不限制
+        gene_list_path: Optional[str] = None,   # 高变基因列表路径
         # 以下参数由 train.py 使用，DataModule 不需要
         raw_data_dir: Optional[str] = None,  # 仅供 train.py 推理 latent 目录
         latent_dir: Optional[str] = None,    # 仅供 train.py 使用
@@ -83,6 +84,7 @@ class RTFDataModule(LightningDataModule):
                 stage_info_path=self.hparams.stage_info_path,
                 use_log_time=self.hparams.use_log_time,
                 max_time_days=self.hparams.max_time_days,
+                gene_list_path=self.hparams.gene_list_path,
             )
 
             # 验证集
@@ -97,6 +99,7 @@ class RTFDataModule(LightningDataModule):
                 stage_info_path=self.hparams.stage_info_path,
                 use_log_time=self.hparams.use_log_time,
                 max_time_days=self.hparams.max_time_days,
+                gene_list_path=self.hparams.gene_list_path,
             )
 
     def train_dataloader(self):

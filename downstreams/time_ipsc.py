@@ -271,7 +271,7 @@ def calculate_metrics(pred_data, true_data, output_dir, label_suffix=""):
 
     return metrics
 
-def run_inference(model, adata, transform_fn, device, out_dir):
+def run_inference(model, adata, transform_fn, device, out_dir, scale_factor=1.0):
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
     
@@ -314,11 +314,14 @@ def run_inference(model, adata, transform_fn, device, out_dir):
             x_curr_np = transform_fn(x_raw)
             x_curr = torch.from_numpy(x_curr_np).to(device)
             
+            # [Scaling]: Normalize input to model range (~0-1)
+            x_curr_scaled = x_curr / scale_factor
+            
             B = x_curr.shape[0]
             
             # Meta
             cond_data = {
-                'x_curr': x_curr,
+                'x_curr': x_curr_scaled,  # Use scaled condition
                 'time_curr': torch.full((B,), normalize_time_vec(np.array([d_curr]))[0], device=device, dtype=torch.float32),
                 'time_next': torch.full((B,), normalize_time_vec(np.array([d_next]))[0], device=device, dtype=torch.float32),
                 'delta_t': torch.full((B,), normalize_delta_t_vec(np.array([d_next - d_curr]))[0], device=device, dtype=torch.float32),
@@ -328,12 +331,14 @@ def run_inference(model, adata, transform_fn, device, out_dir):
             }
             
             # Sample (Prediction)
-            # [Critical Fix]: For the new Data-to-Data training logic,
-            # x_pred is generated starting from x_curr, not from random noise.
+            # Use scaled source x0
             with torch.no_grad():
-                x_pred = model.flow.sample(x_curr, cond_data, steps=50)
+                x_pred_scaled = model.flow.sample(x_curr_scaled, cond_data, steps=50)
                 
-            preds_list.append(x_pred.cpu().numpy())
+            # [Unscaling]: Restore output to log1p space (~0-10)
+            x_pred = x_pred_scaled * scale_factor
+                
+            preds_for_step.append(x_pred.cpu().numpy())
             
         x_pred_all = np.concatenate(preds_for_step, axis=0)
         
@@ -507,11 +512,15 @@ def main():
     model = FlowLitModule.load_from_checkpoint(args.ckpt_path, net=net, map_location=device)
     model.to(device)
     
+    # Get scale factor from hparams (default to 10.0 if not found, though new models should have it)
+    scale_factor = getattr(model.hparams, 'scale_factor', 10.0)
+    print(f"Using scale factor: {scale_factor}")
+    
     # --------------------------------------------------------- 
     # Zero-Shot Inference
     # --------------------------------------------------------- 
     print("\n--- Running Zero-Shot Inference ---")
-    run_inference(model, adata, transform_fn, device, os.path.join(base_out_dir, "zeroshot"))
+    run_inference(model, adata, transform_fn, device, os.path.join(base_out_dir, "zeroshot"), scale_factor)
     
     # --------------------------------------------------------- 
     # Fine-Tuning
@@ -533,6 +542,7 @@ def main():
             for k, v in batch['cond_meta'].items():
                 batch['cond_meta'][k] = v.to(device)
             
+            # FlowLitModule.model_step handles scaling internally if mode='raw'
             loss = model.model_step(batch)
             
             optimizer.zero_grad()
@@ -548,7 +558,7 @@ def main():
     # Fine-Tuned Inference
     # --------------------------------------------------------- 
     print("\n--- Running Fine-Tuned Inference ---")
-    run_inference(model, adata, transform_fn, device, os.path.join(base_out_dir, "finetuned"))
+    run_inference(model, adata, transform_fn, device, os.path.join(base_out_dir, "finetuned"), scale_factor)
 
 if __name__ == "__main__":
     main()

@@ -64,3 +64,7 @@ stage_info_path: /gpfs/flash/home/jcw/projects/research/cellTime/scTFM/data/tedd
 # - false: 使用线性归一化 t / max_t
 use_log_time: true
 
+# 高变基因列表路径 (可选)
+# 如果指定，只读取该列表中的基因
+gene_list_path: null
+

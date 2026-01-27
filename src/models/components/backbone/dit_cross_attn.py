@@ -333,7 +333,7 @@ class DiTCrossAttn(nn.Module):
         # 3. Context Embeddings (for Cross-Attention)
         # ============================================================
         # x_curr -> multiple tokens
-        self.n_xcurr_tokens = 4
+        self.n_xcurr_tokens = 32
         self.x_curr_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_size * self.n_xcurr_tokens),
             nn.SiLU(),

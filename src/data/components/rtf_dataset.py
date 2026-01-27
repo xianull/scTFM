@@ -189,6 +189,7 @@ class SomaRTFDataset(IterableDataset):
         stage_info_path: Optional[str] = None,
         use_log_time: bool = True,
         max_time_days: Optional[float] = None,  # 最大时间筛选（天），None 表示不限制
+        gene_list_path: Optional[str] = None,   # 高变基因列表路径
     ):
         self.root_dir = root_dir
         self.split_label = split_label
@@ -201,6 +202,43 @@ class SomaRTFDataset(IterableDataset):
         self.shard_assignment = shard_assignment
         self.use_log_time = use_log_time
         self.max_time_days = max_time_days
+        
+        # Load Gene List
+        self.gene_indices = None
+        if gene_list_path and os.path.exists(gene_list_path):
+            try:
+                # Load target genes
+                with open(gene_list_path, 'r') as f:
+                    target_genes = [line.strip() for line in f if line.strip()]
+                
+                # We need to map these genes to indices in the dataset.
+                # Assuming the dataset var names are consistent across shards (TileDB constraint).
+                # We load var from the first available shard to build the mapping.
+                if len(self.sub_uris) > 0:
+                    tmp_ctx = tiledbsoma.SOMATileDBContext()
+                    with tiledbsoma.Experiment.open(self.sub_uris[0], context=tmp_ctx) as exp:
+                        var_df = exp.ms[self.measurement_name].var.read().concat().to_pandas()
+                        # Assuming index is gene name or there is a 'feature_id' column
+                        # Adjust based on your schema. Standard is index.
+                        all_genes = var_df.index.tolist()
+                        gene_to_idx = {g: i for i, g in enumerate(all_genes)}
+                        
+                        indices = []
+                        for g in target_genes:
+                            if g in gene_to_idx:
+                                indices.append(gene_to_idx[g])
+                            else:
+                                # Handle missing genes? 
+                                # For strict HVG filtering, we usually just take the intersection.
+                                pass
+                        
+                        if len(indices) > 0:
+                            self.gene_indices = np.array(sorted(indices), dtype=np.int64)
+                            print(f"✅ Loaded {len(self.gene_indices)}/{len(target_genes)} HVGs from {gene_list_path}")
+                        else:
+                            print(f"⚠️ No matching genes found in {gene_list_path}!")
+            except Exception as e:
+                print(f"⚠️ Failed to load gene list: {e}")
 
         self.stage_map = get_stage_map(stage_info_path)
 
@@ -226,6 +264,9 @@ class SomaRTFDataset(IterableDataset):
 
     @property
     def n_vars(self):
+        if self.gene_indices is not None:
+            return len(self.gene_indices)
+            
         if self._n_vars is None:
             tmp_ctx = tiledbsoma.SOMATileDBContext()
             try:
@@ -446,6 +487,30 @@ class SomaRTFDataset(IterableDataset):
                     row_indices = data["soma_dim_0"].to_numpy()
                     col_indices = data["soma_dim_1"].to_numpy()
                     values = data["soma_data"].to_numpy()
+
+                    # Filter by genes if needed
+                    if self.gene_indices is not None:
+                        # Create a mask for valid columns
+                        # We need to map global col_idx to new dense idx (0..N_HVG-1)
+                        # This can be slow if done naively.
+                        # Optimization: Use a lookup array or searchsorted
+                        
+                        # 1. Check which col_indices are in gene_indices
+                        # Since gene_indices is sorted, we can use searchsorted
+                        valid_pos = np.searchsorted(self.gene_indices, col_indices)
+                        
+                        # Handle out of bounds
+                        valid_pos[valid_pos >= len(self.gene_indices)] = 0
+                        
+                        # Check equality to confirm existence
+                        found_genes = self.gene_indices[valid_pos]
+                        mask = (found_genes == col_indices)
+                        
+                        # Filter
+                        row_indices = row_indices[mask]
+                        # col_indices becomes the index into the subset (0..N_HVG-1)
+                        col_indices = valid_pos[mask] 
+                        values = values[mask]
 
                     # 构建 soma_joinid -> local_row 映射
                     joinid_to_local = {jid: i for i, jid in enumerate(read_joinids_sorted)}

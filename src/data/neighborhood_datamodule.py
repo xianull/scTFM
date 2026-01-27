@@ -35,6 +35,7 @@ class NeighborhoodDataModule(LightningDataModule):
         shard_assignment: Optional[Dict] = None,
         # 微环境参数
         bag_size: int = 16,
+        set_size: int = 16, # Alias for bag_size
         mask_ratio: float = 0.0,
         mask_strategy: str = "random",
     ):
@@ -51,11 +52,21 @@ class NeighborhoodDataModule(LightningDataModule):
             split_label_val: 验证集标签
             shard_assignment: 智能负载均衡的 shard 分配方案
             bag_size: 每个微环境 bag 中的细胞数量
+            set_size: bag_size 的别名，优先使用 bag_size (config 中可能两个都有)
             mask_ratio: Masked AE 的掩码比例
             mask_strategy: 掩码策略
         """
         super().__init__()
         self.save_hyperparameters(logger=False)
+        
+        # Resolve bag_size / set_size alias
+        # If set_size passed but bag_size is default, prefer set_size.
+        # However, Hydra instantiates with whatever is in config.
+        # Usually 'set_size' is the parameter we want to use.
+        if set_size != 16 and bag_size == 16:
+             self.hparams.bag_size = set_size
+        # Or just sync them
+        self.hparams.bag_size = set_size # Enforce set_size as primary if passed
 
         self.data_train: Optional[SomaNeighborhoodDataset] = None
         self.data_val: Optional[SomaNeighborhoodDataset] = None

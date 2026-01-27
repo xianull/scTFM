@@ -26,12 +26,12 @@ seed: 42
 trainer:
   min_epochs: 20
   max_epochs: 50
-  gradient_clip_val: 1.0
-  precision: 16-mixed
+  gradient_clip_val: 1.0  # 放宽梯度裁剪 (was 0.5)
+  precision: bf16-mixed   # 使用 BF16 混合精度：更稳(防NaN)、更快、省显存 (was 32)
 
   # GPU Settings
   accelerator: gpu
-  devices: [2,4,6,7]
+  devices: [4,5,6,7]
   strategy: ddp_find_unused_parameters_true
 
 # =============================================================================
@@ -45,7 +45,7 @@ model:
   ae_ckpt_path: null  
 
   optimizer:
-    lr: 5e-5  # Raw 模式建议稍低的学习率以提高稳定性
+    lr: 1e-4  # BF16下可恢复正常学习率 (was 1e-5)
     weight_decay: 1e-5
 
   net:
@@ -61,7 +61,7 @@ model:
 # Data Settings
 # =============================================================================
 data:
-  batch_size: 128         # Raw 模式维度大，适当减小 batch_size 以节省显存
+  batch_size: 256         # Raw 模式维度大，适当减小 batch_size 以节省显存
   num_workers: 8
   max_time_days: 100.0    # 限制筛选时间范围
 

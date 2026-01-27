@@ -20,6 +20,10 @@ model:
   # ===================================================================
   ae_ckpt_path: null  # 示例: "logs/ae_stage1/checkpoints/best.ckpt"
 
+  # [Raw 模式配置] 数据缩放因子
+  # 用于将 log1p 后的数据 (约 0-10) 缩放到 (0-1) 范围，利于训练
+  scale_factor: 10.0
+
   # 优化器
   optimizer:
     _target_: torch.optim.AdamW

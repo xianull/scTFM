@@ -113,6 +113,8 @@ class SetSCAELitModule(LightningModule):
             self.log("train/link_loss", losses["link_loss"], on_step=False, on_epoch=True, sync_dist=True)
         if "mask_pred_loss" in losses:
             self.log("train/mask_pred_loss", losses["mask_pred_loss"], on_step=False, on_epoch=True, sync_dist=True)
+        if "kl_loss" in losses:
+            self.log("train/kl_loss", losses["kl_loss"], on_step=False, on_epoch=True, sync_dist=True)
 
         return losses["loss"]
 

@@ -32,9 +32,9 @@ class FlowLitModule(LightningModule):
         optimizer: torch.optim.Optimizer = None,
         scheduler: torch.optim.lr_scheduler = None,
         compile: bool = False,
-        # 以下参数由 train.py 使用，Module 不需要
-        mode: Optional[str] = None,           # 仅供 train.py 推理数据模式
-        ae_ckpt_path: Optional[str] = None,   # 仅供 train.py 自动提取 latent
+        mode: Optional[str] = None,
+        ae_ckpt_path: Optional[str] = None,
+        scale_factor: float = 1.0,  # 新增缩放因子参数
     ):
         super().__init__()
         
@@ -61,19 +61,23 @@ class FlowLitModule(LightningModule):
         cond_data = batch['cond_meta']
         cond_data['x_curr'] = batch['x_curr']
         
-        # [Critical Fix for Raw Mode]
-        # If mode is 'raw', we perform Data-to-Data flow (x_curr -> x_next).
-        # We pass x_curr as the source (x0) to the flow model.
-        # If mode is 'latent' (or None/default), we usually keep Noise -> Latent, 
-        # but passing x0=None lets RectifiedFlow default to noise.
-        # However, checking self.hparams.mode requires saving it properly.
-        # Let's infer from flow type or just pass x_curr if we believe Data-to-Data is always better for trajectories.
-        # But to be safe and specific to the fix:
-        
+        # [Critical Fix]
+        # Allow x0 (source) to be x_curr if available, enabling Data-to-Data flow
+        # for both 'raw' (gene space) and 'latent' (embedding space) trajectories.
+        # This is essential for modeling cell transitions (Latent t -> Latent t+1).
         x0 = None
-        if self.hparams.mode == 'raw':
+        if self.hparams.mode in ['raw', 'latent']:
             x0 = batch['x_curr']
             
+        # [Scaling for Raw Mode]
+        # If input is log1p transformed (range ~0-10), scale to ~0-1 for stability
+        if self.hparams.mode == 'raw':
+            scale_factor = self.hparams.scale_factor
+            x1 = x1 / scale_factor
+            if x0 is not None:
+                x0 = x0 / scale_factor
+            cond_data['x_curr'] = cond_data['x_curr'] / scale_factor
+
         loss = self.flow(x1, cond_data, x0=x0)
         
         return loss
