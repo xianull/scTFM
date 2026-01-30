@@ -308,6 +308,8 @@ class DiTCrossAttn(nn.Module):
         n_tissues: int = 50,
         n_celltypes: int = 100,
         n_stages: int = 6,
+        n_xcurr_tokens: int = 32,
+        frequency_embedding_size: int = 256,
         cond_dropout: float = 0.1,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
@@ -325,15 +327,15 @@ class DiTCrossAttn(nn.Module):
         # ============================================================
         # 2. Scalar Condition Embeddings (for adaLN)
         # ============================================================
-        self.t_embedder = TimestepEmbedder(hidden_size)  # Flow time t
-        self.abs_time_embedder = TimestepEmbedder(hidden_size)  # Absolute time
-        self.dt_embedder = TimestepEmbedder(hidden_size)  # Delta time
+        self.t_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=frequency_embedding_size)  # Flow time t
+        self.abs_time_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=frequency_embedding_size)  # Absolute time
+        self.dt_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=frequency_embedding_size)  # Delta time
 
         # ============================================================
         # 3. Context Embeddings (for Cross-Attention)
         # ============================================================
         # x_curr -> multiple tokens
-        self.n_xcurr_tokens = 32
+        self.n_xcurr_tokens = n_xcurr_tokens
         self.x_curr_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_size * self.n_xcurr_tokens),
             nn.SiLU(),
@@ -347,7 +349,7 @@ class DiTCrossAttn(nn.Module):
         self.celltype_emb = nn.Embedding(n_celltypes + 1, hidden_size)
 
         # Stage embedding -> 1 token (发育阶段，使用顺序编码)
-        self.stage_emb = StageEmbedder(hidden_size, n_stages=n_stages)
+        self.stage_emb = StageEmbedder(hidden_size, n_stages=n_stages, frequency_embedding_size=frequency_embedding_size)
 
         # Null embeddings for CFG
         self.null_xcurr = nn.Parameter(torch.randn(1, self.n_xcurr_tokens, hidden_size) * 0.02)
@@ -576,6 +578,8 @@ def build_dit_cross_attn(
     n_tissues: int = 12,
     n_celltypes: int = 62,
     n_stages: int = 6,
+    n_xcurr_tokens: int = 32,
+    frequency_embedding_size: int = 256,
     cond_dropout: float = 0.1,
     **kwargs
 ) -> DiTCrossAttn:
@@ -588,6 +592,8 @@ def build_dit_cross_attn(
         n_tissues=n_tissues,
         n_celltypes=n_celltypes,
         n_stages=n_stages,
+        n_xcurr_tokens=n_xcurr_tokens,
+        frequency_embedding_size=frequency_embedding_size,
         cond_dropout=cond_dropout,
         **kwargs
     )

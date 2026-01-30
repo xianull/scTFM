@@ -11,6 +11,10 @@ import seaborn as sns
 from tqdm import tqdm
 from scipy.stats import pearsonr
 from pathlib import Path
+import sys
+
+# Add project root to path so we can import src
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from src.models.flow_module import FlowLitModule
 from src.models.components.backbone.dit_cross_attn import DiTCrossAttn
@@ -239,11 +243,14 @@ class IPSCFineTuneDataset(Dataset):
 # ============================================================================ 
 # Analysis Functions
 # ============================================================================ 
-def calculate_metrics(pred_data, true_data, output_dir, label_suffix=""):
+def calculate_metrics(pred_data, true_data, output_dir, label_suffix="", start_data=None):
     """
     Calculate metrics between predicted and true cell populations.
     Generates plots and returns a dictionary of metrics.
     """
+    from scipy.stats import wasserstein_distance
+    from sklearn.metrics.pairwise import cosine_similarity
+
     metrics = {}
     
     # 1. Mean Gene Expression Correlation
@@ -252,6 +259,74 @@ def calculate_metrics(pred_data, true_data, output_dir, label_suffix=""):
     
     corr_mean, _ = pearsonr(mean_pred, mean_true)
     metrics['Mean_Correlation'] = corr_mean
+
+    # 2. Log Fold Change (LFC) Correlation
+    if start_data is not None:
+        mean_start = np.mean(start_data, axis=0)
+        # Avoid division by zero or log of zero if using log space, 
+        # but data is likely already log1p.
+        # LFC in log space is just difference.
+        lfc_pred = mean_pred - mean_start
+        lfc_true = mean_true - mean_start
+        
+        corr_lfc, _ = pearsonr(lfc_pred, lfc_true)
+        metrics['LFC_Correlation'] = corr_lfc
+        
+        # Scatter LFC
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.scatter(lfc_true, lfc_pred, alpha=0.5, s=5, c='darkgreen', edgecolor='none')
+        min_val = min(lfc_true.min(), lfc_pred.min())
+        max_val = max(lfc_true.max(), lfc_pred.max())
+        ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=1)
+        ax.set_title(f"LFC Correlation: {corr_lfc:.4f}")
+        ax.set_xlabel("True LFC")
+        ax.set_ylabel("Predicted LFC")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"scatter_lfc_{label_suffix}.png"))
+        plt.close()
+
+    # 3. Wasserstein Distance (EMD)
+    # Average EMD across all genes
+    emd_vals = []
+    # If many genes, this can be slow. 
+    # Check if we should subsample? Assuming <5000 genes usually.
+    # If >10k, maybe subsample.
+    n_genes = pred_data.shape[1]
+    gene_indices = range(n_genes)
+    if n_genes > 5000:
+        # random subsample for speed
+        gene_indices = np.random.choice(n_genes, 5000, replace=False)
+        
+    for g in gene_indices:
+        w = wasserstein_distance(pred_data[:, g], true_data[:, g])
+        emd_vals.append(w)
+    metrics['Mean_Wasserstein'] = np.mean(emd_vals)
+
+    # 4. Cell-to-Cell Correlation (Mean Max Correlation)
+    # For each predicted cell, find the most similar cell in the true population.
+    # This measures if the generated cells are realistic.
+    # We use Cosine Similarity.
+    
+    # Subsample for speed if N is large
+    N_pred = pred_data.shape[0]
+    N_true = true_data.shape[0]
+    
+    # Limit to e.g. 1000 cells for metric calculation to stay fast
+    if N_pred > 1000:
+        idx_p = np.random.choice(N_pred, 1000, replace=False)
+        sub_pred = pred_data[idx_p]
+    else:
+        sub_pred = pred_data
+        
+    if N_true > 1000:
+        idx_t = np.random.choice(N_true, 1000, replace=False)
+        sub_true = true_data[idx_t]
+    else:
+        sub_true = true_data
+        
+    sim_matrix = cosine_similarity(sub_pred, sub_true)
+    max_corrs = np.max(sim_matrix, axis=1) # Best match in Truth for each Pred
+    metrics['Mean_Max_Cell_Correlation'] = np.mean(max_corrs)
     
     # Scatter Plot: Mean Expression
     fig, ax = plt.subplots(figsize=(4, 4))
@@ -302,6 +377,7 @@ def run_inference(model, adata, transform_fn, device, out_dir, scale_factor=1.0)
         # --- Prediction Loop ---
         batch_size = 128
         preds_for_step = []
+        start_data_list = []
         
         for b_start in range(0, len(idx_curr), batch_size):
             b_idx = idx_curr[b_start : b_start + batch_size]
@@ -312,6 +388,8 @@ def run_inference(model, adata, transform_fn, device, out_dir, scale_factor=1.0)
                 x_raw = adata.X[b_idx]
                 
             x_curr_np = transform_fn(x_raw)
+            start_data_list.append(x_curr_np)
+
             x_curr = torch.from_numpy(x_curr_np).to(device)
             
             # [Scaling]: Normalize input to model range (~0-1)
@@ -341,13 +419,15 @@ def run_inference(model, adata, transform_fn, device, out_dir, scale_factor=1.0)
             preds_for_step.append(x_pred.cpu().numpy())
             
         x_pred_all = np.concatenate(preds_for_step, axis=0)
+        x_start_all = np.concatenate(start_data_list, axis=0)
         
         # --- Evaluation for this step ---
         step_metrics = calculate_metrics(
             x_pred_all, 
             x_next_true, 
             out_dir, 
-            label_suffix=f"day{d_curr}_to_{d_next}"
+            label_suffix=f"day{d_curr}_to_{d_next}",
+            start_data=x_start_all
         )
         step_metrics['Day_From'] = d_curr
         step_metrics['Day_To'] = d_next
