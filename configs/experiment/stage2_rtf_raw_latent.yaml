@@ -1,0 +1,89 @@
+# @package _global_
+#
+# Stage 2: Rectified Flow Training - Latent Mode (Latent-to-Latent Flow)
+#
+# 核心逻辑：
+# 1. mode: latent (在 AE 的潜在空间训练)
+# 2. Source: x_curr, Target: x_next
+# 3. 适用场景：已经有预训练 AE 时，在潜在空间训练 Flow 模型
+
+defaults:
+  - override /data: rtf_tedd
+  - override /model: flow_stage2_cfg
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "rtf_stage2_latent_trajectory"
+
+tags: ["rtf", "flow", "latent_mode", "trajectory", "stage2"]
+
+seed: 42
+
+# =============================================================================
+# Trainer Settings
+# =============================================================================
+trainer:
+  min_epochs: 20
+  max_epochs: 100
+  gradient_clip_val: 1.0  
+  precision: bf16-mixed   
+
+  # GPU Settings
+  accelerator: gpu
+  devices: [4,5,6,7]
+  strategy: ddp_find_unused_parameters_true
+
+# =============================================================================
+# Model Settings
+# =============================================================================
+model:
+  mode: latent
+  flow_type: rectified_flow
+
+  # Latent 模式需要 AE
+  ae_ckpt_path: "${paths.root_dir}/logs/setscae_stage1_large/runs/2026-01-30_08-13-59/checkpoints/last.ckpt"
+
+  optimizer:
+    lr: 1e-4  
+    weight_decay: 1e-5
+
+  net:
+    input_dim: 1024       # 对应 setscae_stage1_large 的 n_latent
+    hidden_size: 768
+    depth: 16
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.1          
+    cond_dropout: 0.15    
+
+# =============================================================================
+# Data Settings
+# =============================================================================
+data:
+  batch_size: 1024        # Latent 模式维度小，可以增大 batch_size
+  num_workers: 8
+  max_time_days: 100.0    
+  latent_key: "X_latent"
+  latent_dir: "/fast/data/scTFM/rtf/TEDD/tile_4000_fix_latents_1024"
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+callbacks:
+  model_checkpoint:
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
+    monitor: "val/loss"
+    mode: "min"
+    save_top_k: 5
+    save_last: true
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-RTF-Latent"
+    name: "${task_name}_h${model.net.hidden_size}_d${model.net.depth}"
+    group: "latent_trajectory"

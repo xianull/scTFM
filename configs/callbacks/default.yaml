@@ -2,8 +2,8 @@
 model_checkpoint:
   _target_: pytorch_lightning.callbacks.ModelCheckpoint
   dirpath: ${paths.output_dir}/checkpoints
-  filename: "epoch_{epoch:03d}-val_loss_{val/loss:.4f}"
-  monitor: "val/loss"
+  filename: "epoch_{epoch:03d}-loss_{train/loss:.4f}"
+  monitor: "train/loss"
   mode: "min"
   save_last: True      # 总是保存最后一个 epoch，方便断点续训
   save_top_k: 3        # 保存最好的 3 个模型
@@ -12,7 +12,7 @@ model_checkpoint:
 # 2. 早停机制 (如果 Loss 连续 N 个 epoch 不下降就停止)
 early_stopping:
   _target_: pytorch_lightning.callbacks.EarlyStopping
-  monitor: "val/loss"
+  monitor: "train/loss"
   patience: 10         # 容忍 10 个 epoch 不下降
   mode: "min"
 

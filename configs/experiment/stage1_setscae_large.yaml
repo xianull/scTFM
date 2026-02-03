@@ -1,0 +1,111 @@
+# @package _global_
+#
+# Stage 1: SetSCAE Large Scale Training (Set Single-Cell Autoencoder)
+#
+# 用于训练大规模微环境感知的单细胞自编码器 (适配 downstream 1.6B RTF)
+# 策略: Contrastive (默认)
+#
+
+defaults:
+  - override /data: neighborhood_tedd
+  - override /model: setscae_stage1
+  - override /trainer: default
+  - override /callbacks: default
+  - override /logger: wandb
+
+task_name: "setscae_stage1_large"
+
+tags: ["setscae", "ae", "neighborhood", "stage1", "large"]
+
+seed: 42
+
+# =============================================================================
+# Trainer
+# =============================================================================
+trainer:
+  min_epochs: 2
+  max_epochs: 30
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+  # GPU 配置
+  accelerator: gpu
+  devices: [3, 4, 5, 7]
+  strategy: ddp_find_unused_parameters_true
+
+# =============================================================================
+# Model
+# =============================================================================
+model:
+  optimizer:
+    lr: 1e-4
+    weight_decay: 1e-5
+
+  # 网络配置
+  net:
+    # 策略选择: 'graph', 'contrastive', 'masked', 'stack'
+    strategy: "contrastive"
+
+    # 基础参数 - Large Scale
+    n_input: 28231
+    n_hidden: 4096  # 1024 -> 4096
+    n_latent: 1024  # 256 -> 1024 (匹配 1.6B RTF)
+    n_layers: 6     # 4 -> 6
+    dropout_rate: 0.1
+
+    # 集合大小
+    set_size: 128
+
+    # === 差异感知 ===
+    use_difference: true
+
+    # === Contrastive 策略参数 ===
+    contrastive_weight: 0.1
+    temperature: 0.1
+    n_negatives: 64
+
+# =============================================================================
+# Data
+# =============================================================================
+data:
+  batch_size: 64
+  num_workers: 8
+  bag_size: 128  # 与 model.net.set_size 一致
+
+# =============================================================================
+# Callbacks
+# =============================================================================
+# 注意: TEDD neighborhood 数据可能无验证集 (split_label=1)，导致 val/loss 不可用。
+# 使用 train/loss_epoch 作为 fallback，确保 EarlyStopping 和 ModelCheckpoint 能正常工作。
+callbacks:
+  model_checkpoint:
+    _target_: pytorch_lightning.callbacks.ModelCheckpoint
+    dirpath: ${paths.output_dir}/checkpoints
+    filename: "epoch_{epoch:03d}-loss_{train/loss_epoch:.4f}"
+    monitor: "train/loss_epoch"
+    mode: "min"
+    save_top_k: 3
+    save_last: true
+    auto_insert_metric_name: false
+
+  early_stopping:
+    _target_: pytorch_lightning.callbacks.EarlyStopping
+    monitor: "train/loss_epoch"
+    patience: 10
+    mode: "min"
+
+# =============================================================================
+# Logger
+# =============================================================================
+logger:
+  wandb:
+    project: "scTFM-SetSCAE"
+    name: "${task_name}_${model.net.strategy}"
+    tags: ${tags}
+    group: "setscae_stage1_large"
+
+# =============================================================================
+# Hydra
+# =============================================================================
+hydra:
+  mode: RUN
